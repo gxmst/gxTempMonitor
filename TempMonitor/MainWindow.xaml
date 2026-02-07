@@ -1,0 +1,159 @@
+﻿<Window x:Class="TempMonitor.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="TempMonitor" Height="130" Width="135"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        Loaded="Window_Loaded"
+        MouseLeftButtonDown="Window_MouseLeftButtonDown"
+        MouseLeftButtonUp="Window_MouseLeftButtonUp"
+        MouseDoubleClick="Window_MouseDoubleClick"
+        MouseEnter="Window_MouseEnter"
+        MouseLeave="Window_MouseLeave"
+        FontFamily="Segoe UI, Microsoft YaHei">
+    
+    <Window.Resources>
+        <Style x:Key="LabelStyle" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="10"/>
+            <Setter Property="Foreground" Value="#AAAAAA"/>
+            <Setter Property="Width" Value="35"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        
+        <Style x:Key="ValueStyle" TargetType="TextBlock">
+            <Setter Property="FontFamily" Value="Consolas, Courier New"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Width" Value="60"/>
+            <Setter Property="Margin" Value="5,0,0,0"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        
+        <Style x:Key="MaxStyle" TargetType="TextBlock" BasedOn="{StaticResource ValueStyle}">
+            <Setter Property="Foreground" Value="#FFD700"/>
+            <Setter Property="FontSize" Value="10"/>
+            <Setter Property="Margin" Value="10,0,0,0"/>
+        </Style>
+
+        <Storyboard x:Key="ExpandAnim">
+            <DoubleAnimation Storyboard.TargetProperty="Width" To="205" Duration="0:0:0.3">
+                <DoubleAnimation.EasingFunction><QuadraticEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+            </DoubleAnimation>
+        </Storyboard>
+        <Storyboard x:Key="CollapseAnim">
+            <DoubleAnimation Storyboard.TargetProperty="Width" To="135" Duration="0:0:0.3">
+                <DoubleAnimation.EasingFunction><QuadraticEase EasingMode="EaseInOut"/></DoubleAnimation.EasingFunction>
+            </DoubleAnimation>
+        </Storyboard>
+    </Window.Resources>
+
+    <Window.ContextMenu>
+        <ContextMenu x:Name="MainContextMenu">
+            <MenuItem x:Name="StartupMenuItem" Header="开机自启" Click="Startup_Click"/>
+            <Separator/>
+            <MenuItem Header="重置最大值" Click="ResetMax_Click"/>
+            <MenuItem Header="退出 (Exit)" Click="Exit_Click"/>
+        </ContextMenu>
+    </Window.ContextMenu>
+
+    <Border x:Name="MainBorder" Background="#99121212" BorderBrush="#33FFFFFF" BorderThickness="1" CornerRadius="8" Padding="10,4">
+        <Grid>
+            <StackPanel x:Name="MainStack">
+                <!-- Max Header (进一步缩小高度) -->
+                <Grid x:Name="HeaderGrid" Height="10" Opacity="0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="60"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="2" Text="MAX" Foreground="#FFD700" FontSize="8" FontWeight="Bold" Margin="10,0,0,0"/>
+                </Grid>
+
+                <!-- CPU (改用 PreviewMouseDown 以确保能捕获点击) -->
+                <Grid Margin="0,0.5" x:Name="CpuRow" Background="Transparent" PreviewMouseDown="CpuRow_PreviewMouseDown">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition x:Name="MaxColWidth" Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="CPU" Style="{StaticResource LabelStyle}" IsHitTestVisible="False"/>
+                    <TextBlock x:Name="CpuUsageText" Grid.Column="1" Text="0.0 %" Style="{StaticResource ValueStyle}" IsHitTestVisible="False"/>
+                    <Border Grid.Column="2" x:Name="MaxContainer" Width="0" ClipToBounds="True" IsHitTestVisible="False">
+                        <TextBlock x:Name="CpuMaxText" Text="0.0 %" Style="{StaticResource MaxStyle}"/>
+                    </Border>
+                </Grid>
+
+                <!-- GPU -->
+                <Grid Margin="0,0.5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="GPU" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock x:Name="GpuTempText" Grid.Column="1" Text="-- °C" Style="{StaticResource ValueStyle}"/>
+                    <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
+                        <TextBlock x:Name="GpuMaxText" Text="-- °C" Style="{StaticResource MaxStyle}"/>
+                    </Border>
+                </Grid>
+
+                <!-- RAM -->
+                <Grid Margin="0,0.5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="RAM" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock x:Name="RamUsedText" Grid.Column="1" Text="0.0 GB" Style="{StaticResource ValueStyle}"/>
+                    <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
+                        <TextBlock x:Name="RamMaxText" Text="0.0 GB" Style="{StaticResource MaxStyle}"/>
+                    </Border>
+                </Grid>
+
+                <!-- VRAM -->
+                <Grid Margin="0,0.5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="VRAM" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock x:Name="VramUsedText" Grid.Column="1" Text="0.0 GB" Style="{StaticResource ValueStyle}"/>
+                    <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
+                        <TextBlock x:Name="VramMaxText" Text="0.0 GB" Style="{StaticResource MaxStyle}"/>
+                    </Border>
+                </Grid>
+
+                <!-- NET UP -->
+                <Grid Margin="0,0.5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="UP ↑" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock x:Name="NetUpText" Grid.Column="1" Text="0.0 KB/s" Style="{StaticResource ValueStyle}" Foreground="#FF5555" FontSize="10"/>
+                    <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
+                        <TextBlock x:Name="NetUpMaxText" Text="0.0 KB/s" Style="{StaticResource MaxStyle}" FontSize="10"/>
+                    </Border>
+                </Grid>
+
+                <!-- NET DOWN -->
+                <Grid Margin="0,0.5">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="35"/>
+                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="DW ↓" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock x:Name="NetDownText" Grid.Column="1" Text="0.0 KB/s" Style="{StaticResource ValueStyle}" Foreground="#00FF00" FontSize="10"/>
+                    <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
+                        <TextBlock x:Name="NetDownMaxText" Text="0.0 KB/s" Style="{StaticResource MaxStyle}" FontSize="10"/>
+                    </Border>
+                </Grid>
+            </StackPanel>
+        </Grid>
+    </Border>
+</Window>
