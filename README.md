@@ -3,14 +3,14 @@
 一款专为 Windows 打造的、像素级精致的系统监控挂件。
 A pixel-perfect system monitoring widget designed for Windows.
 
+![TempMonitor Preview](TempMonitor/assets/gxtmp.png)
+
 [![GitHub License](https://img.shields.io/github/license/gxmst/gxTempMonitor?style=for-the-badge&logo=github&color=blue)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gxmst/gxTempMonitor?style=for-the-badge&logo=github&color=orange)](https://github.com/gxmst/gxTempMonitor/releases)
 [![Dotnet Version](https://img.shields.io/badge/.NET-10.0-purple?style=for-the-badge&logo=dotnet)](https://dotnet.microsoft.com/download)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue?style=for-the-badge&logo=windows)](https://www.microsoft.com/windows)
 
 ---
-
-## 简体中文版
 
 ### 🎯 核心亮点
 
@@ -44,8 +44,6 @@ A pixel-perfect system monitoring widget designed for Windows.
 *   **Persistence**: 基于 JSON 的配置记忆与跨显示器坐标校验算法
 
 ---
-
-## English Version
 
 ### 🎯 Key Features
 
