@@ -56,6 +56,7 @@ namespace TempMonitor
 
         private LibreHardwareMonitor.Hardware.Computer _computer;
         private DispatcherTimer _timer;
+        private DispatcherTimer _idleTimer; // 新增闲置计时器
         private PerformanceCounter _cpuCounter;
         private PerformanceCounter _recvCounter;
         private PerformanceCounter _sentCounter;
@@ -72,7 +73,6 @@ namespace TempMonitor
         private const double BaseWidth = 135;
         private const double FullWidth = 205;
         private const double AnimDurationMs = 200;
-        private const string ConfigFile = "config.json";
         private string _configPath;
 
         public MainWindow()
@@ -80,7 +80,7 @@ namespace TempMonitor
             var exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
             var exeDir = Path.GetDirectoryName(exePath);
             Directory.SetCurrentDirectory(exeDir);
-            _configPath = Path.Combine(exeDir, ConfigFile);
+            _configPath = Path.Combine(exeDir, "config.json");
             try { File.WriteAllText(Path.Combine(exeDir, "debug_boot.txt"), $"Booted at {DateTime.Now}"); } catch { }
 
             InitializeComponent();
@@ -98,9 +98,16 @@ namespace TempMonitor
                 System.Windows.MessageBox.Show($"初始化失败: {ex.Message}");
                 System.Windows.Application.Current.Shutdown();
             }
+
+            // 主刷新计时器
             _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
             _timer.Tick += Timer_Tick;
             _timer.Start();
+
+            // 闲置计时器初始化
+            _idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) }; // 5秒闲置即淡出
+            _idleTimer.Tick += IdleTimer_Tick;
+            _idleTimer.Start();
         }
 
         private void Window_Loaded(object sender, RoutedEventArgs e) { this.Topmost = true; EnsureWindowIsVisible(); }
@@ -262,8 +269,22 @@ namespace TempMonitor
             if (target != left) this.BeginAnimation(Window.LeftProperty, new DoubleAnimation(target, TimeSpan.FromMilliseconds(200)) { EasingFunction = new QuadraticEase() });
         }
 
+        // --- 闲置自动半透明逻辑 ---
+        private void IdleTimer_Tick(object sender, EventArgs e)
+        {
+            // 执行淡出动画
+            DoubleAnimation fadeOut = new DoubleAnimation(0.1, TimeSpan.FromSeconds(1));
+            this.BeginAnimation(OpacityProperty, fadeOut);
+            _idleTimer.Stop();
+        }
+
         private void Window_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
         {
+            _idleTimer.Stop();
+            // 立即唤醒动画
+            DoubleAnimation fadeIn = new DoubleAnimation(1.0, TimeSpan.FromSeconds(0.2));
+            this.BeginAnimation(OpacityProperty, fadeIn);
+
             double dur = AnimDurationMs; double right = this.Left + this.ActualWidth;
             if (_isDockedRight)
             {
@@ -276,6 +297,8 @@ namespace TempMonitor
 
         private void Window_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
         {
+            _idleTimer.Start();
+
             double dur = AnimDurationMs; double right = this.Left + this.ActualWidth;
             if (_isDockedRight)
             {
@@ -292,6 +315,6 @@ namespace TempMonitor
         private void Window_MouseDoubleClick(object sender, MouseButtonEventArgs e) => System.Windows.Application.Current.Shutdown();
         private void ResetMax_Click(object sender, RoutedEventArgs e) { foreach (var k in _maxValues.Keys.ToList()) _maxValues[k] = 0; }
         private void Exit_Click(object sender, RoutedEventArgs e) => System.Windows.Application.Current.Shutdown();
-        protected override void OnClosed(EventArgs e) { SaveConfig(); _timer?.Stop(); try { _computer?.Close(); } catch { } _cpuCounter?.Dispose(); _recvCounter?.Dispose(); _sentCounter?.Dispose(); base.OnClosed(e); }
+        protected override void OnClosed(EventArgs e) { SaveConfig(); _timer?.Stop(); _idleTimer?.Stop(); try { _computer?.Close(); } catch { } _cpuCounter?.Dispose(); _recvCounter?.Dispose(); _sentCounter?.Dispose(); base.OnClosed(e); }
     }
 }

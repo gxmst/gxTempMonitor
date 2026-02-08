@@ -25,6 +25,7 @@ A pixel-perfect system monitoring widget designed for Windows.
     *   **红绿灯配色**：根据负载（80%/90% 阈值）自动切换白色、橙色、红色，警报一目了然。
     *   **等宽字体锁定**：数值区强制锁定 **Consolas** 字体，彻底解决数字跳动导致的界面抖动。
 *   **🚀 绿色免安**：单文件 EXE 发布，不依赖外部 DLL，支持一键设置开机自启。
+*   **🍃 闲置自动半透明**：智能感应闲置状态，鼠标离开 5 秒后自动淡出至 0.1 透明度，唤醒仅需 0.2 秒。
 
 ### 🔍 交互指南
 
@@ -58,6 +59,7 @@ A pixel-perfect system monitoring widget designed for Windows.
     *   **Status Colors**: Automatically toggles between White, Orange (80%), and Red (90%) based on load levels.
     *   **Monospaced Font**: Numerical areas are locked to **Consolas**, preventing UI jitter caused by varying character widths.
 *   **🚀 Portable & Ready**: Single-file EXE release, no dependencies required, supports one-click auto-start at boot.
+*   **🍃 Idle Fade**: Smart idle detection automatically fades the window to 0.1 opacity after 5 seconds of inactivity, waking up in 0.2s.
 
 ### 🔍 Usage Guide
 
