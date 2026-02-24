@@ -1,10 +1,6 @@
+publish*/
+*.exe
+*.dll
+*.pdb
 bin/
 obj/
-*.user
-*.suo
-*.userosscache
-*.sln.docuser
-config.json
-debug_boot.txt
-TempMonitor/bin/
-TempMonitor/obj/
