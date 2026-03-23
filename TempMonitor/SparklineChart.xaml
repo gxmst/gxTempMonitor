@@ -1,0 +1,26 @@
+<UserControl x:Class="TempMonitor.SparklineChart"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Name="Root"
+             MinHeight="36"
+             UseLayoutRounding="True"
+             SnapsToDevicePixels="True">
+    <Grid>
+        <Path x:Name="AreaPath"
+              Fill="#1400E5FF"
+              Stretch="Fill"/>
+        <Polyline x:Name="LinePath"
+                  StrokeThickness="2"
+                  StrokeLineJoin="Round"
+                  StrokeStartLineCap="Round"
+                  StrokeEndLineCap="Round"
+                  Stretch="Fill">
+            <Polyline.Effect>
+                <DropShadowEffect BlurRadius="5"
+                                  ShadowDepth="0"
+                                  Opacity="0.35"
+                                  Color="#8000E5FF"/>
+            </Polyline.Effect>
+        </Polyline>
+    </Grid>
+</UserControl>

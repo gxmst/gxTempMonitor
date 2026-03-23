@@ -1,7 +1,7 @@
 # gxTempMonitor
 
-一款专为 Windows 打造的、像素级精致的系统监控挂件。
-A pixel-perfect system monitoring widget designed for Windows.
+一款面向 Windows 的桌面监控挂件与主控台组合工具。  
+A Windows desktop monitor widget with a full dashboard companion.
 
 ![TempMonitor Preview](TempMonitor/assets/gxtmp.png)
 
@@ -12,73 +12,163 @@ A pixel-perfect system monitoring widget designed for Windows.
 
 ---
 
-### 🎯 核心亮点
+## 中文简介
 
-*   **🎨 原生交互体验**：深度适配 Windows 视觉规范，采用 60% 透明度深空灰磨砂玻璃效果与 1px 微光白边，视觉精致通透。
-*   **磁力边缘吸附**：支持窗口边缘自动贴合（Snapping），拖动到屏幕左右边缘 50px 内即可自动归位。
-*   **智能生长动画**：具备“避让边缘”的智慧逻辑。当窗口吸附在右边缘时，悬停会自动向左“生长”，确保 MAX 列始终在屏幕内。
-*   **⚡ 极致性能架构**：基于 **Win32 API (P/Invoke)** 和内核级 `PerformanceCounter`，数据采集 0 延迟，资源占用几乎可以忽略。
-*   **🔍 真实物理数据**：
-    *   **RAM**：直接通过 OS 物理内存结构计算，彻底排除虚拟内存/提交内存的虚假读数。
-    *   **VRAM**：专用显存 (Dedicated Memory) 过滤算法，精确反馈显卡物理占用。
-*   **🌈 动态视觉反馈**：
-    *   **红绿灯配色**：根据负载（80%/90% 阈值）自动切换白色、橙色、红色，警报一目了然。
-    *   **等宽字体锁定**：数值区强制锁定 **Consolas** 字体，彻底解决数字跳动导致的界面抖动。
-*   **🚀 绿色免安**：单文件 EXE 发布，不依赖外部 DLL，支持一键设置开机自启。
-*   **🍃 闲置自动半透明**：智能感应闲置状态，鼠标离开 5 秒后自动淡出至 0.1 透明度，唤醒仅需 0.2 秒。
+`gxTempMonitor` 现在由两部分组成：
 
-### 🔍 交互指南
+- 右上角常驻的轻量悬浮挂件
+- 双击挂件打开的深色主控台 `Dashboard`
 
-*   **吸附 (Snap)**：拖动到屏幕边缘自动贴合。
-*   **展开 (Expand)**：鼠标悬停查看各指标的 **MAX (历史峰值)** 数据。
-*   **控制 (Control)**：
-    *   **点击 CPU 行**：快速呼出 Windows 任务管理器。
-    *   **右键菜单**：切换开机自启、重置最大值、安全退出。
-    *   **双击窗口**：闪速退出。
+悬浮挂件适合游戏、全屏或日常桌面下快速瞥一眼；主控台适合看更完整的状态、趋势和详情页。
 
-### 🛠️ 技术实现 (Under the Hood)
+## 当前功能
 
-*   **UI Engine**: .NET 10.0 WPF (Windows Presentation Foundation)
-*   **Hardware Logic**: `LibreHardwareMonitor` (基于 Visitor 模式深度刷新)
-*   **Memory Discovery**: **Win32 P/Invoke (`GlobalMemoryStatusEx`)**
-*   **Data Aggregation**: Windows `PerformanceCounter` API
-*   **Persistence**: 基于 JSON 的配置记忆与跨显示器坐标校验算法
+- 悬浮挂件显示 `CPU / GPU / RAM / VRAM / UP / DN`
+- 悬停展开 `MAX` 历史峰值列
+- 固定贴靠右侧，适合锁定后常驻使用
+- 闲置时自动降低背景存在感，唤醒时恢复
+- 右键菜单与托盘菜单功能同步
+- 支持显示项开关：`RAM / VRAM / UP / DN`
+- 支持恢复默认状态、重置最大值、开机自启、锁定穿透
+- 单实例运行，重复启动会提示“已经在运行”
+- 双击悬浮挂件打开 `Dashboard`
+
+## Dashboard 特性
+
+- 深色无边框主窗口
+- 首页包含 `CPU / GPU / RAM` 环形仪表盘
+- 首页包含最近趋势折线：`CPU / GPU / RAM / VRAM / UP / DN`
+- `CPU / GPU / RAM / 网络` 四个详情页
+- 页面切换淡入淡出动画
+- 支持右下角拖拽缩放
+- 高分屏和 150% 缩放场景下的布局已做专项适配
+
+## 数据来源
+
+- CPU 占用：Windows `PerformanceCounter`
+- RAM：`GlobalMemoryStatusEx`
+- GPU / VRAM / 部分温度、功耗、风扇、频率：`LibreHardwareMonitor`
+- 网络：自动选择当前总流量最高的活跃网卡
+- CPU 温度：优先读取硬件传感器，读不到时尝试 WMI 兜底
+
+说明：
+
+- CPU 温度、CPU 功耗、GPU 功耗、风扇转速等项目是否可读，取决于硬件、驱动和主板暴露的传感器能力。
+- 某些机器上显示 `--` 属于正常现象，不一定是程序异常。
+
+## 交互说明
+
+- 左键拖动悬浮挂件：移动位置
+- 双击悬浮挂件：打开主控台
+- 鼠标悬停挂件：向左展开 `MAX` 列
+- 右键挂件或托盘：打开控制菜单
+- 关闭 `Dashboard`：只隐藏，不退出程序
+- 退出程序：请使用右键菜单中的“退出”
+
+## 配置与持久化
+
+程序会保存以下状态到 `config.json`：
+
+- 窗口位置
+- 锁定状态
+- 开机自启状态
+- `RAM / VRAM / UP / DN` 显示开关
+
+日志会写入：
+
+- `TempMonitor.log`
+
+日志带自动限长，不会无限增长。
+
+## 构建与发布
+
+项目基于：
+
+- `.NET 10`
+- `WPF`
+- `LibreHardwareMonitorLib`
+
+常用命令：
+
+```powershell
+dotnet build TempMonitor/TempMonitor.csproj -c Release
+dotnet publish TempMonitor/TempMonitor.csproj -c Release -r win-x64
+```
+
+仓库根目录还提供了两个打包脚本：
+
+- `build-light.bat`
+  轻量版，依赖目标机器已安装对应的 .NET Desktop Runtime
+- `build-standalone.bat`
+  通用版，自带运行时，体积更大但开箱即用
+
+默认轻量版发布目录：
+
+- `TempMonitor/bin/Release/net10.0-windows/win-x64/publish`
+
+## 项目结构
+
+核心文件大致如下：
+
+- `TempMonitor/MainWindow.xaml`
+  悬浮挂件 UI
+- `TempMonitor/MainWindow.xaml.cs`
+  悬浮挂件交互与展示逻辑
+- `TempMonitor/DashboardWindow.xaml`
+  主控台 UI
+- `TempMonitor/DashboardWindow.xaml.cs`
+  主控台动画、趋势、详情页展示
+- `TempMonitor/HardwareMonitorService.cs`
+  统一采集服务，单例共享给两个窗口
+- `TempMonitor/CircularProgressBar.xaml`
+  环形仪表盘控件
+- `TempMonitor/SparklineChart.xaml`
+  首页趋势折线控件
+
+## 已知限制
+
+- 部分传感器在某些平台上可能不可用
+- `LibreHardwareMonitor` 在不同显卡/主板/笔记本上的可读项差异较大
+- 如果目标机器没有安装对应运行时，轻量版将无法直接启动
 
 ---
 
-### 🎯 Key Features
+## English
 
-*   **🎨 Native Windows Experience**: Deeply integrated with Windows aesthetics, featuring a 60% transparent space-gray frosted glass effect and 1px micro-glow borders.
-*   **Magnetic Edge Snapping**: Supports automatic window snapping. Drag within 50px of the screen edges to snap instantly.
-*   **Smart Growth Animation**: Intelligent "Edge-Aware" logic. When docked to the right edge, the panel expands to the left to ensure the MAX column remains visible.
-*   **⚡ High-Performance Architecture**: Powered by **Win32 API (P/Invoke)** and kernel-level `PerformanceCounter` for zero-latency data collection and minimal resource usage.
-*   **🔍 Accurate Physical Data**:
-    *   **RAM**: Computed directly via OS physical memory structures, eliminating false readings from Virtual Memory/Commit size.
-    *   **VRAM**: Dedicated Memory filtering algorithm provides exact feedback on actual GPU usage.
-*   **🌈 Dynamic Visual Feedback**:
-    *   **Status Colors**: Automatically toggles between White, Orange (80%), and Red (90%) based on load levels.
-    *   **Monospaced Font**: Numerical areas are locked to **Consolas**, preventing UI jitter caused by varying character widths.
-*   **🚀 Portable & Ready**: Single-file EXE release, no dependencies required, supports one-click auto-start at boot.
-*   **🍃 Idle Fade**: Smart idle detection automatically fades the window to 0.1 opacity after 5 seconds of inactivity, waking up in 0.2s.
+`gxTempMonitor` is now a two-part Windows monitoring tool:
 
-### 🔍 Usage Guide
+- a lightweight always-on-top floating widget
+- a double-click dashboard window for richer details
 
-*   **Snap**: Drag to any screen edge for automatic docking.
-*   **Expand**: Hover over the widget to reveal **MAX (Historical Peak)** data.
-*   **Control**:
-    *   **Click CPU row**: Instant launch of Windows Task Manager.
-    *   **Right-click**: Toggle "Auto-start", reset MAX values, or Exit.
-    *   **Double-click**: Quick exit.
+### Highlights
 
-### 🛠️ Technical Stack
+- Floating widget for quick glance monitoring
+- Dashboard with circular gauges and trend sparklines
+- Detail pages for CPU, GPU, RAM, and Network
+- Shared single-instance monitoring service
+- Right-click and tray menus stay in sync
+- Single-instance app behavior
+- High-DPI friendly layout and resizable dashboard
 
-*   **UI Engine**: .NET 10.0 WPF
-*   **Hardware Logic**: `LibreHardwareMonitor` (Visitor Pattern Implementation)
-*   **Memory Discovery**: **Win32 P/Invoke (`GlobalMemoryStatusEx`)**
-*   **Data Aggregation**: Windows `PerformanceCounter` API
-*   **Animation**: WPF Storyboard + DoubleAnimation
-*   **Persistence**: JSON-based config with multi-monitor coordinate validation
+### Data Sources
+
+- CPU usage: Windows `PerformanceCounter`
+- RAM: `GlobalMemoryStatusEx`
+- GPU / VRAM / some power, fan, and thermal metrics: `LibreHardwareMonitor`
+- Network: automatically tracks the most active interface
+
+### Build
+
+```powershell
+dotnet build TempMonitor/TempMonitor.csproj -c Release
+dotnet publish TempMonitor/TempMonitor.csproj -c Release -r win-x64
+```
+
+Release helpers:
+
+- `build-light.bat`
+- `build-standalone.bat`
 
 ---
 
-*Made with ❤️ by Cline for the community.*
+Made for a compact “glance-first” Windows monitoring workflow.

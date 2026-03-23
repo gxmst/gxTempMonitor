@@ -1,0 +1,62 @@
+<UserControl x:Class="TempMonitor.CircularProgressBar"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             x:Name="Root"
+             MinWidth="140"
+             MinHeight="140"
+             Width="180"
+             Height="180"
+             UseLayoutRounding="True"
+             SnapsToDevicePixels="True">
+    <Grid>
+        <Ellipse Stroke="#1C242E"
+                 StrokeThickness="10"
+                 Opacity="0.95"/>
+
+        <Path x:Name="ProgressPath"
+              StrokeThickness="10"
+              StrokeStartLineCap="Round"
+              StrokeEndLineCap="Round">
+            <Path.Effect>
+                <DropShadowEffect BlurRadius="8"
+                                  ShadowDepth="0"
+                                  Opacity="0.7"
+                                  Color="#6600E5FF"/>
+            </Path.Effect>
+            <Path.Stroke>
+                <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                    <GradientStop Color="#00E5FF" Offset="0"/>
+                    <GradientStop Color="#58F6FF" Offset="0.5"/>
+                    <GradientStop Color="#8B5CF6" Offset="1"/>
+                </LinearGradientBrush>
+            </Path.Stroke>
+        </Path>
+
+        <Ellipse Width="136"
+                 Height="136"
+                 Fill="#660B1018"
+                 Stroke="#22FFFFFF"
+                 StrokeThickness="1"
+                 HorizontalAlignment="Center"
+                 VerticalAlignment="Center"/>
+
+        <StackPanel HorizontalAlignment="Center"
+                    VerticalAlignment="Center">
+            <TextBlock Text="{Binding CenterText, ElementName=Root}"
+                       HorizontalAlignment="Center"
+                       Foreground="#FDFEFF"
+                       FontFamily="Cascadia Code, Cascadia Mono, Consolas, Courier New"
+                       FontSize="28"
+                       FontWeight="SemiBold"
+                       TextOptions.TextFormattingMode="Display"/>
+            <TextBlock Text="{Binding Caption, ElementName=Root}"
+                       HorizontalAlignment="Center"
+                       Margin="0,2,0,0"
+                       Foreground="#8C97A6"
+                       FontFamily="Segoe UI"
+                       FontSize="10"
+                       FontWeight="SemiBold"
+                       TextOptions.TextFormattingMode="Display"/>
+        </StackPanel>
+    </Grid>
+</UserControl>

@@ -1,5 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -7,354 +6,587 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
-using System.Windows.Threading;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
-using LibreHardwareMonitor.Hardware;
+using System.Windows.Threading;
 
-namespace TempMonitor
+namespace TempMonitor;
+
+public class AppConfig
 {
-    public class AppConfig
+    public double Top { get; set; } = 100;
+    public double Left { get; set; } = 100;
+    public bool IsDockedRight { get; set; } = true;
+    public bool IsLocked { get; set; }
+    public bool ShowRam { get; set; } = true;
+    public bool ShowVram { get; set; } = true;
+    public bool ShowUpload { get; set; } = true;
+    public bool ShowDownload { get; set; } = true;
+}
+
+public partial class MainWindow : Window
+{
+    [DllImport("user32.dll")]
+    private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+    [DllImport("user32.dll")]
+    private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    private const int GwlExStyle = -20;
+    private const int WsExTransparent = 0x00000020;
+    private const double BaseWidth = 135;
+    private const double FullWidth = 205;
+    private const double AnimDurationMs = 200;
+    private const double MaxContainerWidth = 60;
+    private const double IdleBackgroundOpacity = 0.6;
+    private const double IdleTextOpacity = 0.7;
+
+    private static readonly System.Windows.Media.Brush WarningBrush = CreateFrozenBrush("#FFA500");
+    private static readonly System.Windows.Media.Brush CriticalBrush = CreateFrozenBrush("#FF4444");
+
+    private readonly string _configPath;
+    private DispatcherTimer? _idleTimer;
+    private System.Windows.Forms.NotifyIcon? _notifyIcon;
+    private System.Windows.Forms.ToolStripMenuItem? _trayLockMenuItem;
+    private System.Windows.Forms.ToolStripMenuItem? _trayStartupMenuItem;
+    private System.Windows.Forms.ToolStripMenuItem? _trayShowRamMenuItem;
+    private System.Windows.Forms.ToolStripMenuItem? _trayShowVramMenuItem;
+    private System.Windows.Forms.ToolStripMenuItem? _trayShowUpMenuItem;
+    private System.Windows.Forms.ToolStripMenuItem? _trayShowDownMenuItem;
+    private DashboardWindow? _dashboardWindow;
+
+    private bool _isLocked;
+    private bool _showRam = true;
+    private bool _showVram = true;
+    private bool _showUpload = true;
+    private bool _showDownload = true;
+
+    public MainWindow()
     {
-        public double Top { get; set; } = 100;
-        public double Left { get; set; } = 100;
-        public bool IsDockedRight { get; set; } = true;
-        public bool IsLocked { get; set; } = false;
+        string exePath = Process.GetCurrentProcess().MainModule?.FileName
+            ?? Environment.ProcessPath
+            ?? AppContext.BaseDirectory;
+        string exeDir = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory;
+
+        Directory.SetCurrentDirectory(exeDir);
+        _configPath = Path.Combine(exeDir, "config.json");
+
+        InitializeComponent();
+        InitializeTrayIcon();
+        LoadConfig();
+        HardwareMonitorService.Instance.DataUpdated += OnHardwareDataUpdated;
+        ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
+
+        _idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _idleTimer.Tick += IdleTimer_Tick;
+        _idleTimer.Start();
     }
 
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
-    public class MemoryStatusEx
+    private void InitializeTrayIcon()
     {
-        public uint dwLength;
-        public uint dwMemoryLoad;
-        public ulong ullTotalPhys;
-        public ulong ullAvailPhys;
-        public ulong ullTotalPageFile;
-        public ulong ullAvailPageFile;
-        public ulong ullTotalVirtual;
-        public ulong ullAvailVirtual;
-        public ulong ullAvailExtendedVirtual;
-        public MemoryStatusEx() { this.dwLength = (uint)Marshal.SizeOf(typeof(MemoryStatusEx)); }
-    }
-
-    public class UpdateVisitor : IVisitor
-    {
-        public void VisitComputer(IComputer computer) => computer.Traverse(this);
-        public void VisitHardware(IHardware hardware)
+        _notifyIcon = new System.Windows.Forms.NotifyIcon
         {
-            hardware.Update();
-            foreach (IHardware sub in hardware.SubHardware) sub.Accept(this);
-        }
-        public void VisitSensor(ISensor sensor) { }
-        public void VisitParameter(IParameter parameter) { }
-    }
-
-    public partial class MainWindow : Window
-    {
-        [return: MarshalAs(UnmanagedType.Bool)]
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        static extern bool GlobalMemoryStatusEx([In, Out] MemoryStatusEx lpBuffer);
-
-        [DllImport("user32.dll")]
-        static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-        [DllImport("user32.dll")]
-        static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
-
-        private const int GWL_EXSTYLE = -20;
-        private const int WS_EX_TRANSPARENT = 0x00000020;
-
-        private LibreHardwareMonitor.Hardware.Computer _computer;
-        private DispatcherTimer _timer;
-        private DispatcherTimer _idleTimer;
-        private PerformanceCounter _cpuCounter;
-        private PerformanceCounter _recvCounter;
-        private PerformanceCounter _sentCounter;
-        private string _interfaceName;
-        private UpdateVisitor _updateVisitor = new UpdateVisitor();
-        private System.Windows.Forms.NotifyIcon _notifyIcon;
-
-        private int _zeroTrafficSeconds = 0;
-        private Dictionary<string, float> _maxValues = new Dictionary<string, float>
-        {
-            { "CPU", 0 }, { "GPU", 0 }, { "RAM", 0 }, { "VRAM", 0 }, { "UP", 0 }, { "DOWN", 0 }
+            Text = "gxTempMonitor",
+            Icon = System.Drawing.SystemIcons.Application,
+            Visible = true
         };
 
-        private bool _isLocked = false;
-        private const double BaseWidth = 135;
-        private const double FullWidth = 205;
-        private const double AnimDurationMs = 200;
-        private string _configPath;
+        var contextMenu = new System.Windows.Forms.ContextMenuStrip();
+        _trayLockMenuItem = new System.Windows.Forms.ToolStripMenuItem("锁定 (鼠标穿透)", null, (_, _) => SetLock(!_isLocked));
+        _trayStartupMenuItem = new System.Windows.Forms.ToolStripMenuItem("开机自启", null, (_, _) => ToggleStartup());
+        _trayShowRamMenuItem = new System.Windows.Forms.ToolStripMenuItem("显示内存 (RAM)", null, (_, _) => SetMetricVisibility(MetricVisibility.Ram, !_showRam));
+        _trayShowVramMenuItem = new System.Windows.Forms.ToolStripMenuItem("显示显存 (VRAM)", null, (_, _) => SetMetricVisibility(MetricVisibility.Vram, !_showVram));
+        _trayShowUpMenuItem = new System.Windows.Forms.ToolStripMenuItem("显示上传 (UP)", null, (_, _) => SetMetricVisibility(MetricVisibility.Upload, !_showUpload));
+        _trayShowDownMenuItem = new System.Windows.Forms.ToolStripMenuItem("显示下载 (DN)", null, (_, _) => SetMetricVisibility(MetricVisibility.Download, !_showDownload));
 
-        public MainWindow()
+        var visibilityMenu = new System.Windows.Forms.ToolStripMenuItem("显示项目");
+        visibilityMenu.DropDownItems.Add(_trayShowRamMenuItem);
+        visibilityMenu.DropDownItems.Add(_trayShowVramMenuItem);
+        visibilityMenu.DropDownItems.Add(_trayShowUpMenuItem);
+        visibilityMenu.DropDownItems.Add(_trayShowDownMenuItem);
+
+        contextMenu.Items.Add(_trayLockMenuItem);
+        contextMenu.Items.Add("-");
+        contextMenu.Items.Add(_trayStartupMenuItem);
+        contextMenu.Items.Add("-");
+        contextMenu.Items.Add(visibilityMenu);
+        contextMenu.Items.Add("恢复默认状态", null, (_, _) => RestoreDefaultState());
+        contextMenu.Items.Add("-");
+        contextMenu.Items.Add("重置最大值", null, (_, _) => ResetMaxValues());
+        contextMenu.Items.Add("退出 (Exit)", null, (_, _) => ExitApplication());
+        _notifyIcon.ContextMenuStrip = contextMenu;
+
+        UpdateVisibilityMenuItems();
+        UpdateStartupMenuItem();
+    }
+
+    private void OnHardwareDataUpdated(HardwareSnapshot snapshot)
+    {
+        Dispatcher.InvokeAsync(() => ApplySnapshot(snapshot));
+    }
+
+    private void ApplySnapshot(HardwareSnapshot snapshot)
+    {
+        CpuUsageText.Text = $"{snapshot.CpuUsage:0.0} %";
+        CpuMaxText.Text = $"{snapshot.CpuUsageMax:0.0} %";
+        CpuUsageText.Foreground = GetAlertBrush(snapshot.CpuUsage);
+        UpdateIndicator(CpuIndicator, snapshot.CpuUsage);
+
+        if (snapshot.GpuTemperature.HasValue)
         {
-            var exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
-            var exeDir = Path.GetDirectoryName(exePath);
-            Directory.SetCurrentDirectory(exeDir);
-            _configPath = Path.Combine(exeDir, "config.json");
-            
-            InitializeComponent();
-            InitializeTrayIcon();
-            LoadConfig();
+            GpuTempText.Text = $"{snapshot.GpuTemperature.Value:0.0} °C";
+            GpuMaxText.Text = $"{(snapshot.GpuTemperatureMax ?? snapshot.GpuTemperature.Value):0.0} °C";
+            GpuTempText.Foreground = GetAlertBrush(snapshot.GpuTemperature.Value);
+            UpdateIndicator(GpuIndicator, snapshot.GpuTemperature.Value);
+        }
+        else
+        {
+            GpuTempText.Text = "-- °C";
+            GpuMaxText.Text = "-- °C";
+            GpuTempText.Foreground = System.Windows.Media.Brushes.White;
+            UpdateIndicator(GpuIndicator, 0);
+        }
+
+        RamUsedText.Text = $"{snapshot.RamUsedGb:F1} GB";
+        RamMaxText.Text = $"{snapshot.RamUsedMaxGb:F1} GB";
+        RamUsedText.Foreground = GetAlertBrush(snapshot.RamUsagePercent);
+        UpdateIndicator(RamIndicator, snapshot.RamUsagePercent);
+
+        if (snapshot.VramUsedGb.HasValue)
+        {
+            VramUsedText.Text = $"{snapshot.VramUsedGb.Value:F1} GB";
+            VramMaxText.Text = $"{(snapshot.VramUsedMaxGb ?? snapshot.VramUsedGb.Value):F1} GB";
+        }
+        else
+        {
+            VramUsedText.Text = "-- GB";
+            VramMaxText.Text = "-- GB";
+        }
+
+        NetUpText.Text = FormatSpeed(snapshot.NetUploadBytesPerSecond);
+        NetUpMaxText.Text = FormatSpeed(snapshot.NetUploadMaxBytesPerSecond);
+        NetDownText.Text = FormatSpeed(snapshot.NetDownloadBytesPerSecond);
+        NetDownMaxText.Text = FormatSpeed(snapshot.NetDownloadMaxBytesPerSecond);
+    }
+
+    private void SetLock(bool lockIt)
+    {
+        _isLocked = lockIt;
+
+        IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        int extendedStyle = GetWindowLong(hwnd, GwlExStyle);
+
+        if (lockIt)
+        {
+            SetWindowLong(hwnd, GwlExStyle, extendedStyle | WsExTransparent);
+        }
+        else
+        {
+            SetWindowLong(hwnd, GwlExStyle, extendedStyle & ~WsExTransparent);
+        }
+
+        LockMenuItem.Header = lockIt ? "√ 锁定中 (右键托盘解锁)" : "锁定 (鼠标穿透)";
+        if (_trayLockMenuItem != null)
+        {
+            _trayLockMenuItem.Text = lockIt ? "√ 锁定中 (鼠标穿透)" : "锁定 (鼠标穿透)";
+        }
+
+        SaveConfig();
+    }
+
+    private void Lock_Click(object sender, RoutedEventArgs e) => SetLock(!_isLocked);
+
+    private void Window_Loaded(object sender, RoutedEventArgs e)
+    {
+        Topmost = true;
+        EnsureWindowIsVisible();
+        FixedToRight();
+
+        if (_isLocked)
+        {
+            SetLock(true);
+        }
+    }
+
+    private void FixedToRight()
+    {
+        Left = SystemParameters.WorkArea.Width - FullWidth;
+    }
+
+    private void LoadConfig()
+    {
+        try
+        {
+            if (!File.Exists(_configPath))
+            {
+                ApplyVisibilitySettings();
+                return;
+            }
+
+            var config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(_configPath));
+            if (config != null)
+            {
+                Top = config.Top;
+                _isLocked = config.IsLocked;
+                _showRam = config.ShowRam;
+                _showVram = config.ShowVram;
+                _showUpload = config.ShowUpload;
+                _showDownload = config.ShowDownload;
+            }
+
+            ApplyVisibilitySettings();
+        }
+        catch
+        {
+        }
+    }
+
+    private void SaveConfig()
+    {
+        try
+        {
+            File.WriteAllText(_configPath, JsonSerializer.Serialize(new AppConfig
+            {
+                Top = Top,
+                Left = Left,
+                IsDockedRight = true,
+                IsLocked = _isLocked,
+                ShowRam = _showRam,
+                ShowVram = _showVram,
+                ShowUpload = _showUpload,
+                ShowDownload = _showDownload
+            }));
+        }
+        catch
+        {
+        }
+    }
+
+    private void EnsureWindowIsVisible()
+    {
+        double currentHeight = ActualHeight > 0 ? ActualHeight : 130;
+        double maxTop = Math.Max(0, SystemParameters.WorkArea.Height - currentHeight);
+        if (Top < 0 || Top > maxTop)
+        {
+            Top = Math.Min(100, maxTop);
+        }
+    }
+
+    private void ApplyVisibilitySettings()
+    {
+        RamRow.Visibility = _showRam ? Visibility.Visible : Visibility.Collapsed;
+        VramRow.Visibility = _showVram ? Visibility.Visible : Visibility.Collapsed;
+        NetUpRow.Visibility = _showUpload ? Visibility.Visible : Visibility.Collapsed;
+        NetDownRow.Visibility = _showDownload ? Visibility.Visible : Visibility.Collapsed;
+        UpdateVisibilityMenuItems();
+    }
+
+    private void UpdateVisibilityMenuItems()
+    {
+        ShowRamMenuItem.IsChecked = _showRam;
+        ShowVramMenuItem.IsChecked = _showVram;
+        ShowUpMenuItem.IsChecked = _showUpload;
+        ShowDownMenuItem.IsChecked = _showDownload;
+
+        if (_trayShowRamMenuItem != null)
+        {
+            _trayShowRamMenuItem.Checked = _showRam;
+        }
+
+        if (_trayShowVramMenuItem != null)
+        {
+            _trayShowVramMenuItem.Checked = _showVram;
+        }
+
+        if (_trayShowUpMenuItem != null)
+        {
+            _trayShowUpMenuItem.Checked = _showUpload;
+        }
+
+        if (_trayShowDownMenuItem != null)
+        {
+            _trayShowDownMenuItem.Checked = _showDownload;
+        }
+    }
+
+    private void SetMetricVisibility(MetricVisibility metric, bool isVisible)
+    {
+        switch (metric)
+        {
+            case MetricVisibility.Ram:
+                _showRam = isVisible;
+                break;
+            case MetricVisibility.Vram:
+                _showVram = isVisible;
+                break;
+            case MetricVisibility.Upload:
+                _showUpload = isVisible;
+                break;
+            case MetricVisibility.Download:
+                _showDownload = isVisible;
+                break;
+        }
+
+        ApplyVisibilitySettings();
+        SaveConfig();
+    }
+
+    private void RestoreDefaultState()
+    {
+        _showRam = true;
+        _showVram = true;
+        _showUpload = true;
+        _showDownload = true;
+        ResetMaxValues();
+        ApplyVisibilitySettings();
+        ResetWindowPosition();
+        if (_isLocked)
+        {
+            SetLock(false);
+        }
+
+        EnsureWindowIsVisible();
+        FixedToRight();
+        SaveConfig();
+    }
+
+    private void ResetWindowPosition()
+    {
+        Top = 100;
+        Left = SystemParameters.WorkArea.Width - FullWidth;
+    }
+
+    private string GetStartupShortcutPath() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "TempMonitor.lnk");
+
+    private void ToggleStartup()
+    {
+        string path = GetStartupShortcutPath();
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
+        else
+        {
             try
             {
-                _computer = new LibreHardwareMonitor.Hardware.Computer { IsGpuEnabled = true };
-                _computer.Open();
-                _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                FindActiveNetworkInterface();
-                UpdateStartupMenuItem();
+                string exePath = Process.GetCurrentProcess().MainModule?.FileName
+                    ?? throw new InvalidOperationException("无法获取当前程序路径。");
+                Type shellType = Type.GetTypeFromProgID("WScript.Shell")
+                    ?? throw new InvalidOperationException("WScript.Shell 不可用。");
+                dynamic shell = Activator.CreateInstance(shellType)
+                    ?? throw new InvalidOperationException("无法创建快捷方式对象。");
+                dynamic shortcut = shell.CreateShortcut(path);
+                shortcut.TargetPath = exePath;
+                shortcut.WorkingDirectory = Path.GetDirectoryName(exePath);
+                shortcut.Save();
             }
             catch (Exception ex)
             {
-                System.Windows.MessageBox.Show($"初始化失败: {ex.Message}");
-                System.Windows.Application.Current.Shutdown();
+                System.Windows.MessageBox.Show("失败: " + ex.Message);
             }
-
-            _timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
-            _timer.Tick += Timer_Tick;
-            _timer.Start();
-
-            _idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
-            _idleTimer.Tick += IdleTimer_Tick;
-            _idleTimer.Start();
         }
 
-        private void InitializeTrayIcon()
+        UpdateStartupMenuItem();
+    }
+
+    private void UpdateStartupMenuItem()
+    {
+        bool enabled = File.Exists(GetStartupShortcutPath());
+        StartupMenuItem.Header = enabled ? "√ 开机自启" : "开机自启";
+        if (_trayStartupMenuItem != null)
         {
-            _notifyIcon = new System.Windows.Forms.NotifyIcon();
-            _notifyIcon.Text = "gxTempMonitor";
-            _notifyIcon.Icon = System.Drawing.SystemIcons.Application;
-            _notifyIcon.Visible = true;
-
-            var contextMenu = new System.Windows.Forms.ContextMenuStrip();
-            contextMenu.Items.Add("解除锁定 (Unlock)", null, (s, e) => { SetLock(false); });
-            contextMenu.Items.Add("-");
-            contextMenu.Items.Add("退出 (Exit)", null, (s, e) => { System.Windows.Application.Current.Shutdown(); });
-            _notifyIcon.ContextMenuStrip = contextMenu;
+            _trayStartupMenuItem.Text = enabled ? "√ 开机自启" : "开机自启";
         }
+    }
 
-        private void SetLock(bool lockIt)
+    private void Startup_Click(object sender, RoutedEventArgs e) => ToggleStartup();
+
+    private void ShowRam_Click(object sender, RoutedEventArgs e) => SetMetricVisibility(MetricVisibility.Ram, !_showRam);
+
+    private void ShowVram_Click(object sender, RoutedEventArgs e) => SetMetricVisibility(MetricVisibility.Vram, !_showVram);
+
+    private void ShowUp_Click(object sender, RoutedEventArgs e) => SetMetricVisibility(MetricVisibility.Upload, !_showUpload);
+
+    private void ShowDown_Click(object sender, RoutedEventArgs e) => SetMetricVisibility(MetricVisibility.Download, !_showDownload);
+
+    private void RestoreDefaultState_Click(object sender, RoutedEventArgs e) => RestoreDefaultState();
+
+    private void IdleTimer_Tick(object? sender, EventArgs e)
+    {
+        AnimateBackgroundOpacity(IdleBackgroundOpacity, TimeSpan.FromSeconds(1));
+        AnimateMainContentOpacity(IdleTextOpacity, TimeSpan.FromSeconds(1));
+        _idleTimer?.Stop();
+    }
+
+    private void MainBorder_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
+    {
+        _idleTimer?.Stop();
+        AnimateBackgroundOpacity(1.0, TimeSpan.FromSeconds(0.2));
+        AnimateMainContentOpacity(1.0, TimeSpan.FromSeconds(0.2));
+
+        double duration = AnimDurationMs;
+        MainBorder.BeginAnimation(FrameworkElement.WidthProperty,
+            new DoubleAnimation(FullWidth, TimeSpan.FromMilliseconds(duration))
+            {
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut }
+            });
+
+        AnimateMaxContainer(MaxContainerWidth, duration);
+        AnimateOpacity(HeaderGrid, 1, duration);
+    }
+
+    private void MainBorder_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
+    {
+        _idleTimer?.Start();
+
+        double duration = AnimDurationMs;
+        MainBorder.BeginAnimation(FrameworkElement.WidthProperty,
+            new DoubleAnimation(BaseWidth, TimeSpan.FromMilliseconds(duration))
+            {
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut }
+            });
+
+        AnimateMaxContainer(0, duration);
+        AnimateOpacity(HeaderGrid, 0, duration);
+    }
+
+    private void AnimateMaxContainer(double target, double milliseconds) =>
+        MaxContainer.BeginAnimation(FrameworkElement.WidthProperty,
+            new DoubleAnimation(target, TimeSpan.FromMilliseconds(milliseconds))
+            {
+                EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut }
+            });
+
+    private void AnimateOpacity(UIElement element, double target, double milliseconds) =>
+        element.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(target, TimeSpan.FromMilliseconds(milliseconds)));
+
+    private void AnimateBackgroundOpacity(double targetOpacity, TimeSpan duration) =>
+        MainBackgroundBrush.BeginAnimation(SolidColorBrush.OpacityProperty, new DoubleAnimation(targetOpacity, duration));
+
+    private void AnimateMainContentOpacity(double targetOpacity, TimeSpan duration) =>
+        MainStack.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(targetOpacity, duration));
+
+    private void UpdateIndicator(System.Windows.Controls.Border indicator, float value)
+    {
+        if (value >= 90)
         {
-            _isLocked = lockIt;
-            IntPtr hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
-            int extendedStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-            if (lockIt)
-                SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle | WS_EX_TRANSPARENT);
-            else
-                SetWindowLong(hwnd, GWL_EXSTYLE, extendedStyle & ~WS_EX_TRANSPARENT);
-
-            if (LockMenuItem != null) LockMenuItem.Header = lockIt ? "√ 锁定中 (右键托盘解锁)" : "锁定 (鼠标穿透)";
-            SaveConfig();
+            indicator.Background = CriticalBrush;
+            indicator.Opacity = 1;
+            return;
         }
 
-        private void Lock_Click(object sender, RoutedEventArgs e) => SetLock(!_isLocked);
+        if (value >= 80)
+        {
+            indicator.Background = WarningBrush;
+            indicator.Opacity = 1;
+            return;
+        }
 
-        private void Window_Loaded(object sender, RoutedEventArgs e) 
-        { 
-            this.Topmost = true; 
-            EnsureWindowIsVisible(); 
+        indicator.Opacity = 0;
+    }
+
+    private static System.Windows.Media.Brush CreateFrozenBrush(string colorHex)
+    {
+        var brush = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(colorHex));
+        brush.Freeze();
+        return brush;
+    }
+
+    private static System.Windows.Media.Brush GetAlertBrush(float value)
+    {
+        if (value >= 90)
+        {
+            return CriticalBrush;
+        }
+
+        if (value >= 80)
+        {
+            return WarningBrush;
+        }
+
+        return System.Windows.Media.Brushes.White;
+    }
+
+    private static string FormatSpeed(float bytesPerSecond)
+    {
+        if (bytesPerSecond < 1024)
+        {
+            return $"{bytesPerSecond:0.0}B";
+        }
+
+        float kb = bytesPerSecond / 1024;
+        if (kb < 1024)
+        {
+            return $"{kb:0.0}K";
+        }
+
+        return $"{kb / 1024.0:0.1}M";
+    }
+
+    private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.LeftButton == MouseButtonState.Pressed)
+        {
+            DragMove();
             FixedToRight();
-            if (_isLocked) SetLock(true);
         }
+    }
 
-        private void FixedToRight()
+    private void Window_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        FixedToRight();
+        SaveConfig();
+    }
+
+    private void Window_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        _dashboardWindow ??= new DashboardWindow();
+        if (!_dashboardWindow.IsVisible)
         {
-            // 始终让窗口宽度为 FullWidth (205)
-            // 这样内部 MainBorder (135->205) 在右侧对齐时，不需要改变 Window.Left
-            double workWidth = SystemParameters.WorkArea.Width;
-            this.Left = workWidth - FullWidth;
+            _dashboardWindow.Show();
         }
 
-        private void LoadConfig()
+        if (_dashboardWindow.WindowState == WindowState.Minimized)
         {
-            try
-            {
-                if (File.Exists(_configPath))
-                {
-                    var config = JsonSerializer.Deserialize<AppConfig>(File.ReadAllText(_configPath));
-                    if (config != null) 
-                    { 
-                        this.Top = config.Top; 
-                        _isLocked = config.IsLocked;
-                    }
-                }
-            }
-            catch { }
+            _dashboardWindow.WindowState = WindowState.Normal;
         }
 
-        private void SaveConfig()
+        _dashboardWindow.Activate();
+    }
+
+    private void ResetMaxValues() => HardwareMonitorService.Instance.ResetMaxValues();
+
+    private void ResetMax_Click(object sender, RoutedEventArgs e) => ResetMaxValues();
+
+    private void ExitApplication()
+    {
+        if (_dashboardWindow != null)
         {
-            try { File.WriteAllText(_configPath, JsonSerializer.Serialize(new AppConfig { Top = this.Top, Left = this.Left, IsDockedRight = true, IsLocked = _isLocked })); }
-            catch { }
+            _dashboardWindow.PrepareForExit();
+            _dashboardWindow.Close();
+            _dashboardWindow = null;
         }
 
-        private void EnsureWindowIsVisible()
-        {
-            double h = SystemParameters.PrimaryScreenHeight;
-            if (this.Top < 0 || this.Top > h) { this.Top = 100; }
-        }
+        System.Windows.Application.Current.Shutdown();
+    }
 
-        private void FindActiveNetworkInterface()
-        {
-            try
-            {
-                var category = new PerformanceCounterCategory("Network Interface");
-                string[] instances = category.GetInstanceNames();
-                string bestInstance = null; float maxTraffic = -1;
-                foreach (var instance in instances)
-                {
-                    if (instance.Contains("Loopback") || instance.Contains("VMware") || instance.Contains("Virtual") || instance.Contains("Teredo") || instance.Contains("Pseudo")) continue;
-                    using (var counter = new PerformanceCounter("Network Interface", "Bytes Total/sec", instance))
-                    {
-                        counter.NextValue(); System.Threading.Thread.Sleep(50); float val = counter.NextValue();
-                        if (val > maxTraffic) { maxTraffic = val; bestInstance = instance; }
-                    }
-                }
-                if (bestInstance != null)
-                {
-                    _interfaceName = bestInstance; _recvCounter?.Dispose(); _sentCounter?.Dispose();
-                    _recvCounter = new PerformanceCounter("Network Interface", "Bytes Received/sec", _interfaceName);
-                    _sentCounter = new PerformanceCounter("Network Interface", "Bytes Sent/sec", _interfaceName);
-                }
-            }
-            catch { }
-        }
+    private void Exit_Click(object sender, RoutedEventArgs e) => ExitApplication();
 
-        private void Timer_Tick(object sender, EventArgs e) => UpdateMetrics();
+    protected override void OnClosed(EventArgs e)
+    {
+        HardwareMonitorService.Instance.DataUpdated -= OnHardwareDataUpdated;
+        _notifyIcon?.Dispose();
+        SaveConfig();
+        _idleTimer?.Stop();
+        base.OnClosed(e);
+    }
 
-        private void UpdateMetrics()
-        {
-            try { float cpu = _cpuCounter.NextValue(); UpdateMax("CPU", cpu); CpuUsageText.Text = $"{cpu:0.0} %"; CpuMaxText.Text = $"{_maxValues["CPU"]:0.0} %"; CpuUsageText.Foreground = GetAlertBrush(cpu); } catch { }
-            try { 
-                MemoryStatusEx msex = new MemoryStatusEx();
-                if (GlobalMemoryStatusEx(msex)) {
-                    double used = msex.ullTotalPhys - msex.ullAvailPhys;
-                    float usedGB = (float)(used / (1024.0 * 1024.0 * 1024.0));
-                    float usage = (float)msex.dwMemoryLoad;
-                    UpdateMax("RAM", usedGB); RamUsedText.Text = $"{usedGB:F1} GB"; RamMaxText.Text = $"{_maxValues["RAM"]:F1} GB"; RamUsedText.Foreground = GetAlertBrush(usage);
-                }
-            } catch { }
-            try
-            {
-                _computer.Accept(_updateVisitor);
-                float? gpuTemp = null; float? vramGB = null;
-                foreach (IHardware hardware in _computer.Hardware)
-                {
-                    if (hardware.HardwareType.ToString().Contains("Gpu"))
-                    {
-                        var temp = hardware.Sensors.FirstOrDefault(s => s.SensorType == SensorType.Temperature && (s.Name.Contains("GPU Core") || s.Name.Contains("Core")) && s.Value > 0);
-                        if (temp != null) gpuTemp = temp.Value;
-                        foreach (var sensor in hardware.Sensors)
-                        {
-                            if (sensor.SensorType == SensorType.SmallData && sensor.Name.Contains("Memory", StringComparison.OrdinalIgnoreCase))
-                            {
-                                if (sensor.Name.Contains("Shared") || sensor.Name.Contains("Total")) continue;
-                                if (!sensor.Name.Contains("Dedicated") && sensor.Value > 24000) continue;
-                                if (sensor.Value.HasValue && sensor.Value.Value > 0) { vramGB = sensor.Value.Value / 1024f; break; }
-                            }
-                        }
-                    }
-                }
-                if (gpuTemp.HasValue) { UpdateMax("GPU", gpuTemp.Value); GpuTempText.Text = $"{gpuTemp.Value:0.0} °C"; GpuMaxText.Text = $"{_maxValues["GPU"]:0.0} °C"; GpuTempText.Foreground = GetAlertBrush(gpuTemp.Value); }
-                if (vramGB.HasValue) { UpdateMax("VRAM", vramGB.Value); VramUsedText.Text = $"{vramGB.Value:F1} GB"; VramMaxText.Text = $"{_maxValues["VRAM"]:F1} GB"; }
-            }
-            catch { }
-            if (_recvCounter != null && _sentCounter != null)
-            {
-                try
-                {
-                    float up = _sentCounter.NextValue(); float down = _recvCounter.NextValue();
-                    if (up <= 0 && down <= 0) _zeroTrafficSeconds++; else _zeroTrafficSeconds = 0;
-                    if (_zeroTrafficSeconds >= 5) { _zeroTrafficSeconds = 0; FindActiveNetworkInterface(); }
-                    UpdateMax("UP", up); UpdateMax("DOWN", down);
-                    NetUpText.Text = FormatSpeed(up); NetUpMaxText.Text = FormatSpeed(_maxValues["UP"]);
-                    NetDownText.Text = FormatSpeed(down); NetDownMaxText.Text = FormatSpeed(_maxValues["DOWN"]);
-                }
-                catch { FindActiveNetworkInterface(); }
-            }
-        }
-
-        private System.Windows.Media.Brush GetAlertBrush(float value)
-        {
-            if (value >= 90) return new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FF4444"));
-            if (value >= 80) return new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#FFA500"));
-            return System.Windows.Media.Brushes.White;
-        }
-
-        private void UpdateMax(string key, float current) { if (current > _maxValues[key]) _maxValues[key] = current; }
-        private string FormatSpeed(float bytesPerSec)
-        {
-            if (bytesPerSec < 1024) return $"{bytesPerSec:0.0} B/s";
-            float kb = bytesPerSec / 1024;
-            if (kb < 1024) return $"{kb:0.0} KB/s";
-            return $"{(kb / 1024.0):0.1} MB/s";
-        }
-
-        private string GetStartupShortcutPath() => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "TempMonitor.lnk");
-        private void UpdateStartupMenuItem() => StartupMenuItem.Header = File.Exists(GetStartupShortcutPath()) ? "√ 开机自启" : "开机自启";
-        private void Startup_Click(object sender, RoutedEventArgs e)
-        {
-            string path = GetStartupShortcutPath();
-            if (File.Exists(path)) File.Delete(path);
-            else
-            {
-                try
-                {
-                    string exe = Process.GetCurrentProcess().MainModule.FileName;
-                    Type t = Type.GetTypeFromProgID("WScript.Shell"); dynamic s = Activator.CreateInstance(t);
-                    var lnk = s.CreateShortcut(path); lnk.TargetPath = exe; lnk.WorkingDirectory = Path.GetDirectoryName(exe); lnk.Save();
-                }
-                catch (Exception ex) { System.Windows.MessageBox.Show("失败: " + ex.Message); }
-            }
-            UpdateStartupMenuItem();
-        }
-
-        private void IdleTimer_Tick(object sender, EventArgs e)
-        {
-            DoubleAnimation fadeOut = new DoubleAnimation(0.3, TimeSpan.FromSeconds(1));
-            this.BeginAnimation(OpacityProperty, fadeOut);
-            _idleTimer.Stop();
-        }
-
-        private void MainBorder_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
-        {
-            _idleTimer.Stop();
-            DoubleAnimation fadeIn = new DoubleAnimation(1.0, TimeSpan.FromSeconds(0.2));
-            this.BeginAnimation(OpacityProperty, fadeIn);
-
-            double dur = AnimDurationMs;
-            // 仅对 MainBorder 进行宽度动画
-            MainBorder.BeginAnimation(FrameworkElement.WidthProperty, new DoubleAnimation(FullWidth, TimeSpan.FromMilliseconds(dur)) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut } });
-            
-            AnimateMaxContainer(60, dur); AnimateOpacity(HeaderGrid, 1, dur);
-        }
-
-        private void MainBorder_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
-        {
-            _idleTimer.Start();
-            double dur = AnimDurationMs;
-            MainBorder.BeginAnimation(FrameworkElement.WidthProperty, new DoubleAnimation(BaseWidth, TimeSpan.FromMilliseconds(dur)) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut } });
-            
-            AnimateMaxContainer(0, dur); AnimateOpacity(HeaderGrid, 0, dur);
-        }
-
-        private void AnimateMaxContainer(double t, double ms) => MaxContainer.BeginAnimation(FrameworkElement.WidthProperty, new DoubleAnimation(t, TimeSpan.FromMilliseconds(ms)) { EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseInOut } });
-        private void AnimateOpacity(UIElement e, double t, double ms) => e.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(t, TimeSpan.FromMilliseconds(ms)));
-        
-        private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e) 
-        { 
-            if (e.LeftButton == MouseButtonState.Pressed) 
-            {
-                this.DragMove(); 
-                FixedToRight();
-            }
-        }
-        private void Window_MouseLeftButtonUp(object sender, MouseButtonEventArgs e) { FixedToRight(); SaveConfig(); }
-        private void Window_MouseDoubleClick(object sender, MouseButtonEventArgs e) => System.Windows.Application.Current.Shutdown();
-        private void ResetMax_Click(object sender, RoutedEventArgs e) { foreach (var k in _maxValues.Keys.ToList()) _maxValues[k] = 0; }
-        private void Exit_Click(object sender, RoutedEventArgs e) => System.Windows.Application.Current.Shutdown();
-        protected override void OnClosed(EventArgs e) { 
-            if (_notifyIcon != null) _notifyIcon.Dispose();
-            SaveConfig(); _timer?.Stop(); _idleTimer?.Stop(); try { _computer?.Close(); } catch { } _cpuCounter?.Dispose(); _recvCounter?.Dispose(); _sentCounter?.Dispose(); base.OnClosed(e); 
-        }
+    private enum MetricVisibility
+    {
+        Ram,
+        Vram,
+        Upload,
+        Download
     }
 }
