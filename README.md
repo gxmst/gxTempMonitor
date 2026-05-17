@@ -1,7 +1,7 @@
 # gxTempMonitor
 
-一款面向 Windows 的桌面监控挂件与主控台组合工具。  
-A Windows desktop monitor widget with a full dashboard companion.
+轻量 Windows 桌面监控挂件，游戏兼容，零内核驱动。  
+A lightweight Windows desktop monitor widget — game-safe, zero kernel drivers.
 
 ![TempMonitor Preview](TempMonitor/assets/gxtmp.png)
 
@@ -12,163 +12,104 @@ A Windows desktop monitor widget with a full dashboard companion.
 
 ---
 
-## 中文简介
+## 为什么做这个
 
-`gxTempMonitor` 现在由两部分组成：
+市面上的硬件监控工具（如 HWMonitor、LibreHardwareMonitor）依赖内核驱动读取传感器，运行游戏时容易被反作弊系统（Vanguard、EAC、BattlEye 等）标记或踢出。
 
-- 右上角常驻的轻量悬浮挂件
-- 双击挂件打开的深色主控台 `Dashboard`
+gxTempMonitor 的设计原则：**只用用户态 API，不加载任何内核驱动，不扫描任何进程**。在游戏全屏时也能安全常驻。
 
-悬浮挂件适合游戏、全屏或日常桌面下快速瞥一眼；主控台适合看更完整的状态、趋势和详情页。
+## 功能
 
-## 当前功能
+### 悬浮挂件
 
-- 悬浮挂件显示 `CPU / GPU / RAM / VRAM / UP / DN`
-- 悬停展开 `MAX` 历史峰值列
-- 固定贴靠右侧，适合锁定后常驻使用
+- 右上角常驻，显示 `CPU / GPU / RAM / VRAM / UP / DN`
+- 鼠标悬停展开 `MAX` 历史峰值列
 - 闲置时自动降低背景存在感，唤醒时恢复
+- 可锁定鼠标穿透，游戏时不遮挡操作
 - 右键菜单与托盘菜单功能同步
-- 支持显示项开关：`RAM / VRAM / UP / DN`
-- 支持恢复默认状态、重置最大值、开机自启、锁定穿透
-- 单实例运行，重复启动会提示“已经在运行”
-- 双击悬浮挂件打开 `Dashboard`
 
-## Dashboard 特性
+### Dashboard 主控台
 
-- 深色无边框主窗口
-- 首页包含 `CPU / GPU / RAM` 环形仪表盘
-- 首页包含最近趋势折线：`CPU / GPU / RAM / VRAM / UP / DN`
-- `CPU / GPU / RAM / 网络` 四个详情页
+- 双击挂件打开深色主控台
+- 环形仪表盘：CPU / GPU / RAM
+- 趋势折线：CPU / GPU / RAM / VRAM / UP / DN
+- 详情页：CPU / GPU / RAM / 网络
 - 页面切换淡入淡出动画
-- 支持右下角拖拽缩放
-- 高分屏和 150% 缩放场景下的布局已做专项适配
+- 右下角拖拽缩放
+- 高分屏适配
 
 ## 数据来源
 
-- CPU 占用：Windows `PerformanceCounter`
-- RAM：`GlobalMemoryStatusEx`
-- GPU / VRAM / 部分温度、功耗、风扇、频率：`LibreHardwareMonitor`
-- 网络：自动选择当前总流量最高的活跃网卡
-- CPU 温度：优先读取硬件传感器，读不到时尝试 WMI 兜底
+| 指标 | 数据源 | 内核驱动 |
+|------|--------|---------|
+| GPU 温度 | NVIDIA NVML (`nvml.dll`) | ❌ |
+| GPU 使用率 | NVIDIA NVML | ❌ |
+| 显存使用 | NVIDIA NVML | ❌ |
+| GPU 功耗 | NVIDIA NVML | ❌ |
+| CPU 使用率 | Windows PerformanceCounter | ❌ |
+| 内存使用 | `GlobalMemoryStatusEx` | ❌ |
+| 网络流量 | Windows PerformanceCounter | ❌ |
 
-说明：
+所有数据通过用户态 API 获取，不加载 WinRing0 等内核驱动，不触发反作弊检测。
 
-- CPU 温度、CPU 功耗、GPU 功耗、风扇转速等项目是否可读，取决于硬件、驱动和主板暴露的传感器能力。
-- 某些机器上显示 `--` 属于正常现象，不一定是程序异常。
+> NVIDIA GPU 通过 NVML 读取，需要系统已安装 NVIDIA 驱动。AMD GPU 暂不支持温度读取，显存和使用率后续可通过 ADLX 支持。
 
-## 交互说明
+## 交互
 
-- 左键拖动悬浮挂件：移动位置
-- 双击悬浮挂件：打开主控台
-- 鼠标悬停挂件：向左展开 `MAX` 列
-- 右键挂件或托盘：打开控制菜单
-- 关闭 `Dashboard`：只隐藏，不退出程序
-- 退出程序：请使用右键菜单中的“退出”
+| 操作 | 效果 |
+|------|------|
+| 左键拖动挂件 | 移动位置 |
+| 双击挂件 | 打开 Dashboard |
+| 鼠标悬停挂件 | 展开 MAX 列 |
+| 右键挂件或托盘 | 控制菜单 |
+| 关闭 Dashboard | 仅隐藏，不退出 |
+| 菜单"退出" | 退出程序 |
 
-## 配置与持久化
+## 配置
 
-程序会保存以下状态到 `config.json`：
+程序保存以下状态到 `config.json`：
 
 - 窗口位置
 - 锁定状态
-- 开机自启状态
-- `RAM / VRAM / UP / DN` 显示开关
+- RAM / VRAM / UP / DN 显示开关
 
-日志会写入：
+日志写入 `TempMonitor.log`，自动限长不无限增长。
 
-- `TempMonitor.log`
-
-日志带自动限长，不会无限增长。
-
-## 构建与发布
-
-项目基于：
-
-- `.NET 10`
-- `WPF`
-- `LibreHardwareMonitorLib`
-
-常用命令：
+## 构建
 
 ```powershell
 dotnet build TempMonitor/TempMonitor.csproj -c Release
 dotnet publish TempMonitor/TempMonitor.csproj -c Release -r win-x64
 ```
 
-仓库根目录还提供了两个打包脚本：
+打包脚本：
 
-- `build-light.bat`
-  轻量版，依赖目标机器已安装对应的 .NET Desktop Runtime
-- `build-standalone.bat`
-  通用版，自带运行时，体积更大但开箱即用
-
-默认轻量版发布目录：
-
-- `TempMonitor/bin/Release/net10.0-windows/win-x64/publish`
+- `build-light.bat` — 轻量版，需目标机器安装 .NET 10 Desktop Runtime
+- `build-standalone.bat` — 独立版，自带运行时，开箱即用
 
 ## 项目结构
 
-核心文件大致如下：
-
-- `TempMonitor/MainWindow.xaml`
-  悬浮挂件 UI
-- `TempMonitor/MainWindow.xaml.cs`
-  悬浮挂件交互与展示逻辑
-- `TempMonitor/DashboardWindow.xaml`
-  主控台 UI
-- `TempMonitor/DashboardWindow.xaml.cs`
-  主控台动画、趋势、详情页展示
-- `TempMonitor/HardwareMonitorService.cs`
-  统一采集服务，单例共享给两个窗口
-- `TempMonitor/CircularProgressBar.xaml`
-  环形仪表盘控件
-- `TempMonitor/SparklineChart.xaml`
-  首页趋势折线控件
-
-## 已知限制
-
-- 部分传感器在某些平台上可能不可用
-- `LibreHardwareMonitor` 在不同显卡/主板/笔记本上的可读项差异较大
-- 如果目标机器没有安装对应运行时，轻量版将无法直接启动
-
----
-
-## English
-
-`gxTempMonitor` is now a two-part Windows monitoring tool:
-
-- a lightweight always-on-top floating widget
-- a double-click dashboard window for richer details
-
-### Highlights
-
-- Floating widget for quick glance monitoring
-- Dashboard with circular gauges and trend sparklines
-- Detail pages for CPU, GPU, RAM, and Network
-- Shared single-instance monitoring service
-- Right-click and tray menus stay in sync
-- Single-instance app behavior
-- High-DPI friendly layout and resizable dashboard
-
-### Data Sources
-
-- CPU usage: Windows `PerformanceCounter`
-- RAM: `GlobalMemoryStatusEx`
-- GPU / VRAM / some power, fan, and thermal metrics: `LibreHardwareMonitor`
-- Network: automatically tracks the most active interface
-
-### Build
-
-```powershell
-dotnet build TempMonitor/TempMonitor.csproj -c Release
-dotnet publish TempMonitor/TempMonitor.csproj -c Release -r win-x64
+```
+TempMonitor/
+├── App.xaml.cs                  应用入口，单实例互斥
+├── MainWindow.xaml(.cs)         悬浮挂件
+├── DashboardWindow.xaml(.cs)    主控台
+├── HardwareMonitorService.cs    硬件数据采集服务（单例）
+├── VendorGpuMonitor.cs          NVIDIA NVML 用户态 API 封装
+├── UiHelper.cs                  UI 工具类（格式化、告警色）
+├── CircularProgressBar.xaml(.cs) 环形仪表盘控件
+├── SparklineChart.xaml(.cs)     趋势折线控件
+└── app.manifest                以当前用户权限运行（asInvoker）
 ```
 
-Release helpers:
+## 技术栈
 
-- `build-light.bat`
-- `build-standalone.bat`
+- .NET 10 / WPF
+- NVIDIA NVML（用户态 GPU 监控）
+- Windows PerformanceCounter（CPU / 网络）
+- `GlobalMemoryStatusEx`（内存）
+- 无第三方内核驱动依赖
 
 ---
 
-Made for a compact “glance-first” Windows monitoring workflow.
+Made for a compact, game-safe Windows monitoring workflow.

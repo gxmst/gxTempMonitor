@@ -3,10 +3,8 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Management;
 using System.Runtime.InteropServices;
 using System.Threading;
-using LibreHardwareMonitor.Hardware;
 
 namespace TempMonitor;
 
@@ -15,15 +13,10 @@ public sealed class HardwareSnapshot
     public DateTime Timestamp { get; init; } = DateTime.Now;
     public float CpuUsage { get; init; }
     public float CpuUsageMax { get; init; }
-    public float? CpuClockMhz { get; init; }
-    public float? CpuPackagePowerWatts { get; init; }
-    public float? CpuTemperature { get; init; }
-    public float? CpuTemperatureMax { get; init; }
     public float GpuUsagePercent { get; init; }
-    public float? GpuPowerWatts { get; init; }
-    public float? GpuFanRpm { get; init; }
     public float? GpuTemperature { get; init; }
     public float? GpuTemperatureMax { get; init; }
+    public float? GpuPowerWatts { get; init; }
     public float RamUsedGb { get; init; }
     public float RamAvailableGb { get; init; }
     public float RamUsedMaxGb { get; init; }
@@ -58,28 +51,6 @@ internal sealed class MemoryStatusEx
     }
 }
 
-internal sealed class UpdateVisitor : IVisitor
-{
-    public void VisitComputer(IComputer computer) => computer.Traverse(this);
-
-    public void VisitHardware(IHardware hardware)
-    {
-        hardware.Update();
-        foreach (IHardware subHardware in hardware.SubHardware)
-        {
-            subHardware.Accept(this);
-        }
-    }
-
-    public void VisitSensor(ISensor sensor)
-    {
-    }
-
-    public void VisitParameter(IParameter parameter)
-    {
-    }
-}
-
 public sealed class HardwareMonitorService : IDisposable
 {
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -88,13 +59,17 @@ public sealed class HardwareMonitorService : IDisposable
 
     private static readonly Lazy<HardwareMonitorService> LazyInstance = new(() => new HardwareMonitorService());
 
+    private const int InterfaceRefreshIntervalSeconds = 10;
+    private const int ZeroTrafficRecheckSeconds = 5;
+    private const int MaxLogBytes = 256 * 1024;
+    private const int RetainedLogBytes = 128 * 1024;
+
     private readonly object _syncRoot = new();
-    private readonly UpdateVisitor _updateVisitor = new();
+    private readonly object _logLock = new();
     private readonly Dictionary<string, PerformanceCounter> _trafficCounters = new(StringComparer.Ordinal);
     private readonly Dictionary<string, float> _maxValues = new()
     {
         { "CPU_USAGE", 0 },
-        { "CPU_TEMP", 0 },
         { "GPU_TEMP", 0 },
         { "RAM", 0 },
         { "VRAM", 0 },
@@ -103,21 +78,18 @@ public sealed class HardwareMonitorService : IDisposable
     };
     private readonly HashSet<string> _reportedErrors = new(StringComparer.Ordinal);
     private readonly string _logPath;
-    private readonly System.Threading.Timer _timer;
 
-    private Computer? _computer;
     private PerformanceCounter? _cpuCounter;
     private PerformanceCounter? _recvCounter;
     private PerformanceCounter? _sentCounter;
+    private VendorGpuMonitor? _vendorGpuMonitor;
     private string? _interfaceName;
     private int _zeroTrafficSeconds;
     private int _networkRefreshCounter = InterfaceRefreshIntervalSeconds;
     private bool _disposed;
 
-    private const int InterfaceRefreshIntervalSeconds = 10;
-    private const int ZeroTrafficRecheckSeconds = 5;
-    private const int MaxLogBytes = 256 * 1024;
-    private const int RetainedLogBytes = 128 * 1024;
+    private CancellationTokenSource? _cts;
+    private Thread? _pollThread;
 
     public static HardwareMonitorService Instance => LazyInstance.Value;
 
@@ -133,15 +105,18 @@ public sealed class HardwareMonitorService : IDisposable
         string exeDir = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory;
         _logPath = Path.Combine(exeDir, "TempMonitor.log");
 
-        InitializeMonitoring();
-        _timer = new System.Threading.Timer(_ => PollMetrics(), null, TimeSpan.Zero, TimeSpan.FromSeconds(1));
+        Initialize();
+
+        _cts = new CancellationTokenSource();
+        _pollThread = new Thread(PollLoop) { IsBackground = true, Name = "HardwareMonitorPoll" };
+        _pollThread.Start();
     }
 
     public void ResetMaxValues()
     {
         lock (_syncRoot)
         {
-            foreach (string key in _maxValues.Keys.ToList())
+            foreach (string key in _maxValues.Keys)
             {
                 _maxValues[key] = 0;
             }
@@ -150,28 +125,29 @@ public sealed class HardwareMonitorService : IDisposable
 
     public void Dispose()
     {
-        if (_disposed)
+        if (_disposed) return;
+        _disposed = true;
+
+        DataUpdated = null;
+
+        _cts?.Cancel();
+
+        if (_pollThread != null && !_pollThread.Join(3000))
         {
-            return;
+            try { _pollThread.Interrupt(); } catch { }
         }
 
-        _disposed = true;
-        _timer.Dispose();
+        _cts?.Dispose();
+        _cts = null;
+        _pollThread = null;
 
         lock (_syncRoot)
         {
-            try
-            {
-                _computer?.Close();
-            }
-            catch (Exception ex)
-            {
-                ReportError("close-hardware", ex);
-            }
-
             _cpuCounter?.Dispose();
             _recvCounter?.Dispose();
             _sentCounter?.Dispose();
+            _vendorGpuMonitor?.Dispose();
+            _vendorGpuMonitor = null;
 
             foreach (PerformanceCounter counter in _trafficCounters.Values)
             {
@@ -182,18 +158,40 @@ public sealed class HardwareMonitorService : IDisposable
         }
     }
 
-    private void InitializeMonitoring()
+    private void PollLoop()
+    {
+        while (!_disposed)
+        {
+            try
+            {
+                if (!_cts!.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1)))
+                {
+                    PollMetrics();
+                }
+                else
+                {
+                    break;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ThreadInterruptedException)
+            {
+                break;
+            }
+        }
+    }
+
+    private void Initialize()
     {
         lock (_syncRoot)
         {
             try
             {
-                _computer = new Computer
-                {
-                    IsCpuEnabled = true,
-                    IsGpuEnabled = true
-                };
-                _computer.Open();
+                _vendorGpuMonitor = new VendorGpuMonitor();
+                _vendorGpuMonitor.TryInitialize();
 
                 _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
                 _cpuCounter.NextValue();
@@ -205,17 +203,13 @@ public sealed class HardwareMonitorService : IDisposable
             catch (Exception ex)
             {
                 ReportError("init", ex);
-                throw;
             }
         }
     }
 
     private void PollMetrics()
     {
-        if (_disposed)
-        {
-            return;
-        }
+        if (_disposed) return;
 
         HardwareSnapshot snapshot;
         lock (_syncRoot)
@@ -231,11 +225,23 @@ public sealed class HardwareMonitorService : IDisposable
     {
         float cpuUsage = ReadCpuUsage();
         (float ramUsedGb, float ramUsagePercent, float totalRamGb) = ReadRamUsage();
-        (float? cpuTemp, float? cpuClockMhz, float? cpuPackagePowerWatts, float gpuUsagePercent, float? gpuTemp, float? gpuPowerWatts, float? gpuFanRpm, float? vramGb) = ReadHardwareMetrics();
         (float upload, float download) = ReadNetworkMetrics();
 
+        float gpuUsagePercent = 0;
+        float? gpuTemp = null;
+        float? gpuPowerWatts = null;
+        float? vramGb = null;
+
+        if (_vendorGpuMonitor?.Initialized == true)
+        {
+            var gpu = _vendorGpuMonitor.Read();
+            gpuTemp = gpu.Temperature;
+            gpuUsagePercent = gpu.Usage ?? 0;
+            vramGb = gpu.VramUsedGb;
+            gpuPowerWatts = gpu.PowerWatts;
+        }
+
         UpdateMax("CPU_USAGE", cpuUsage);
-        UpdateMaxIfHasValue("CPU_TEMP", cpuTemp);
         UpdateMaxIfHasValue("GPU_TEMP", gpuTemp);
         UpdateMax("RAM", ramUsedGb);
         UpdateMaxIfHasValue("VRAM", vramGb);
@@ -247,15 +253,10 @@ public sealed class HardwareMonitorService : IDisposable
             Timestamp = DateTime.Now,
             CpuUsage = cpuUsage,
             CpuUsageMax = _maxValues["CPU_USAGE"],
-            CpuClockMhz = cpuClockMhz,
-            CpuPackagePowerWatts = cpuPackagePowerWatts,
-            CpuTemperature = cpuTemp,
-            CpuTemperatureMax = _maxValues["CPU_TEMP"] > 0 ? _maxValues["CPU_TEMP"] : null,
             GpuUsagePercent = gpuUsagePercent,
-            GpuPowerWatts = gpuPowerWatts,
-            GpuFanRpm = gpuFanRpm,
             GpuTemperature = gpuTemp,
             GpuTemperatureMax = _maxValues["GPU_TEMP"] > 0 ? _maxValues["GPU_TEMP"] : null,
+            GpuPowerWatts = gpuPowerWatts,
             RamUsedGb = ramUsedGb,
             RamAvailableGb = Math.Max(0, totalRamGb - ramUsedGb),
             RamUsedMaxGb = _maxValues["RAM"],
@@ -274,10 +275,7 @@ public sealed class HardwareMonitorService : IDisposable
 
     private float ReadCpuUsage()
     {
-        if (_cpuCounter == null)
-        {
-            return 0;
-        }
+        if (_cpuCounter == null) return 0;
 
         try
         {
@@ -297,10 +295,7 @@ public sealed class HardwareMonitorService : IDisposable
         try
         {
             var memoryStatus = new MemoryStatusEx();
-            if (!GlobalMemoryStatusEx(memoryStatus))
-            {
-                return (0, 0, 0);
-            }
+            if (!GlobalMemoryStatusEx(memoryStatus)) return (0, 0, 0);
 
             double total = memoryStatus.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
             double used = (memoryStatus.ullTotalPhys - memoryStatus.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
@@ -314,175 +309,6 @@ public sealed class HardwareMonitorService : IDisposable
         }
     }
 
-    private (float? CpuTemp, float? CpuClockMhz, float? CpuPackagePowerWatts, float GpuUsagePercent, float? GpuTemp, float? GpuPowerWatts, float? GpuFanRpm, float? VramGb) ReadHardwareMetrics()
-    {
-        if (_computer == null)
-        {
-            return (null, null, null, 0, null, null, null, null);
-        }
-
-        try
-        {
-            _computer.Accept(_updateVisitor);
-
-            float? cpuTemp = null;
-            float? cpuClockMhz = null;
-            float? cpuPackagePowerWatts = null;
-            float gpuUsagePercent = 0;
-            float? gpuTemp = null;
-            float? gpuPowerWatts = null;
-            float? gpuFanRpm = null;
-            float? vramGb = null;
-
-            foreach (IHardware hardware in _computer.Hardware)
-            {
-                if (hardware.HardwareType == HardwareType.Cpu)
-                {
-                    cpuTemp = ReadTemperatureSensor(hardware.Sensors, "Package")
-                        ?? ReadTemperatureSensor(hardware.Sensors, "Core")
-                        ?? cpuTemp;
-                    cpuPackagePowerWatts = ReadPreferredSensorValue(hardware.Sensors, SensorType.Power, "Package")
-                        ?? cpuPackagePowerWatts;
-                    cpuClockMhz = ReadCpuClock(hardware.Sensors) ?? cpuClockMhz;
-                    continue;
-                }
-
-                if (!hardware.HardwareType.ToString().Contains("Gpu", StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                gpuTemp = ReadTemperatureSensor(hardware.Sensors, "GPU Core")
-                    ?? ReadTemperatureSensor(hardware.Sensors, "Core")
-                    ?? gpuTemp;
-                gpuUsagePercent = ReadGpuUsage(hardware.Sensors) ?? gpuUsagePercent;
-                gpuPowerWatts = ReadPreferredSensorValue(hardware.Sensors, SensorType.Power, "Total")
-                    ?? ReadPreferredSensorValue(hardware.Sensors, SensorType.Power, "Package")
-                    ?? ReadPreferredSensorValue(hardware.Sensors, SensorType.Power, "Power")
-                    ?? gpuPowerWatts;
-                gpuFanRpm = ReadPreferredSensorValue(hardware.Sensors, SensorType.Fan, "GPU")
-                    ?? ReadPreferredSensorValue(hardware.Sensors, SensorType.Fan, "Fan")
-                    ?? gpuFanRpm;
-
-                foreach (ISensor sensor in hardware.Sensors)
-                {
-                    if (sensor.SensorType != SensorType.SmallData ||
-                        !sensor.Name.Contains("Memory", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    if (sensor.Name.Contains("Shared", StringComparison.OrdinalIgnoreCase) ||
-                        sensor.Name.Contains("Total", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    if (!sensor.Name.Contains("Dedicated", StringComparison.OrdinalIgnoreCase) &&
-                        sensor.Value is > 24000)
-                    {
-                        continue;
-                    }
-
-                    if (sensor.Value is float value and > 0)
-                    {
-                        vramGb = value / 1024f;
-                        break;
-                    }
-                }
-            }
-
-            cpuTemp ??= TryReadCpuTemperatureFromWmi();
-            ClearReportedError("metric-hardware");
-            return (cpuTemp, cpuClockMhz, cpuPackagePowerWatts, gpuUsagePercent, gpuTemp, gpuPowerWatts, gpuFanRpm, vramGb);
-        }
-        catch (Exception ex)
-        {
-            ReportError("metric-hardware", ex);
-            return (null, null, null, 0, null, null, null, null);
-        }
-    }
-
-    private static float? ReadTemperatureSensor(IEnumerable<ISensor> sensors, string preferredName) =>
-        sensors.FirstOrDefault(sensor =>
-            sensor.SensorType == SensorType.Temperature &&
-            sensor.Name.Contains(preferredName, StringComparison.OrdinalIgnoreCase) &&
-            sensor.Value is > 0)?.Value;
-
-    private static float? ReadPreferredSensorValue(IEnumerable<ISensor> sensors, SensorType sensorType, string preferredName) =>
-        sensors.FirstOrDefault(sensor =>
-            sensor.SensorType == sensorType &&
-            sensor.Name.Contains(preferredName, StringComparison.OrdinalIgnoreCase) &&
-            sensor.Value is > 0)?.Value
-        ?? sensors.FirstOrDefault(sensor =>
-            sensor.SensorType == sensorType &&
-            sensor.Value is > 0)?.Value;
-
-    private static float? ReadCpuClock(IEnumerable<ISensor> sensors)
-    {
-        float? averageClock = sensors.FirstOrDefault(sensor =>
-            sensor.SensorType == SensorType.Clock &&
-            sensor.Name.Contains("Average", StringComparison.OrdinalIgnoreCase) &&
-            sensor.Value is > 0)?.Value;
-        if (averageClock.HasValue)
-        {
-            return averageClock.Value;
-        }
-
-        float[] coreClocks = sensors
-            .Where(sensor =>
-                sensor.SensorType == SensorType.Clock &&
-                sensor.Name.Contains("Core", StringComparison.OrdinalIgnoreCase) &&
-                sensor.Value is > 0)
-            .Select(sensor => sensor.Value!.Value)
-            .ToArray();
-
-        if (coreClocks.Length == 0)
-        {
-            return null;
-        }
-
-        return coreClocks.Average();
-    }
-
-    private static float? ReadGpuUsage(IEnumerable<ISensor> sensors) =>
-        sensors.FirstOrDefault(sensor =>
-            sensor.SensorType == SensorType.Load &&
-            sensor.Name.Contains("GPU Core", StringComparison.OrdinalIgnoreCase) &&
-            sensor.Value is >= 0)?.Value
-        ?? sensors.FirstOrDefault(sensor =>
-            sensor.SensorType == SensorType.Load &&
-            (sensor.Name.Contains("D3D", StringComparison.OrdinalIgnoreCase) ||
-             sensor.Name.Contains("Core", StringComparison.OrdinalIgnoreCase) ||
-             sensor.Name.Contains("GPU", StringComparison.OrdinalIgnoreCase)) &&
-            sensor.Value is >= 0)?.Value;
-
-    private float? TryReadCpuTemperatureFromWmi()
-    {
-        try
-        {
-            using var searcher = new ManagementObjectSearcher(@"root\WMI", "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature");
-            foreach (ManagementObject obj in searcher.Get())
-            {
-                if (obj["CurrentTemperature"] is uint raw && raw > 0)
-                {
-                    float celsius = (raw / 10f) - 273.15f;
-                    if (celsius is > 0 and < 150)
-                    {
-                        ClearReportedError("metric-cpu-temp-wmi");
-                        return celsius;
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            ReportError("metric-cpu-temp-wmi", ex);
-        }
-
-        return null;
-    }
-
     private (float Upload, float Download) ReadNetworkMetrics()
     {
         _networkRefreshCounter++;
@@ -493,10 +319,7 @@ public sealed class HardwareMonitorService : IDisposable
             SelectBestNetworkInterface();
         }
 
-        if (_recvCounter == null || _sentCounter == null)
-        {
-            return (0, 0);
-        }
+        if (_recvCounter == null || _sentCounter == null) return (0, 0);
 
         try
         {
@@ -540,9 +363,7 @@ public sealed class HardwareMonitorService : IDisposable
             foreach (string instance in instanceNames)
             {
                 if (ShouldIgnoreInterface(instance) || _trafficCounters.ContainsKey(instance))
-                {
                     continue;
-                }
 
                 var counter = new PerformanceCounter("Network Interface", "Bytes Total/sec", instance);
                 counter.NextValue();
@@ -574,10 +395,7 @@ public sealed class HardwareMonitorService : IDisposable
 
     private void SelectBestNetworkInterface()
     {
-        if (_trafficCounters.Count == 0)
-        {
-            return;
-        }
+        if (_trafficCounters.Count == 0) return;
 
         try
         {
@@ -626,10 +444,7 @@ public sealed class HardwareMonitorService : IDisposable
         _sentCounter = null;
         _interfaceName = interfaceName;
 
-        if (string.IsNullOrWhiteSpace(interfaceName))
-        {
-            return;
-        }
+        if (string.IsNullOrWhiteSpace(interfaceName)) return;
 
         _recvCounter = new PerformanceCounter("Network Interface", "Bytes Received/sec", interfaceName);
         _sentCounter = new PerformanceCounter("Network Interface", "Bytes Sent/sec", interfaceName);
@@ -645,30 +460,26 @@ public sealed class HardwareMonitorService : IDisposable
     private void UpdateMax(string key, float current)
     {
         if (current > _maxValues[key])
-        {
             _maxValues[key] = current;
-        }
     }
 
     private void UpdateMaxIfHasValue(string key, float? current)
     {
         if (current.HasValue)
-        {
             UpdateMax(key, current.Value);
-        }
     }
 
     private void ReportError(string key, Exception ex)
     {
-        if (!_reportedErrors.Add(key))
-        {
-            return;
-        }
+        if (!_reportedErrors.Add(key)) return;
 
         try
         {
-            TrimLogIfNeeded();
-            File.AppendAllText(_logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {key}: {ex}{Environment.NewLine}");
+            lock (_logLock)
+            {
+                TrimLogIfNeeded();
+                File.AppendAllText(_logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {key}: {ex}{Environment.NewLine}");
+            }
         }
         catch
         {
@@ -677,16 +488,10 @@ public sealed class HardwareMonitorService : IDisposable
 
     private void TrimLogIfNeeded()
     {
-        if (!File.Exists(_logPath))
-        {
-            return;
-        }
+        if (!File.Exists(_logPath)) return;
 
         var fileInfo = new FileInfo(_logPath);
-        if (fileInfo.Length <= MaxLogBytes)
-        {
-            return;
-        }
+        if (fileInfo.Length <= MaxLogBytes) return;
 
         using var source = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         long bytesToKeep = Math.Min(RetainedLogBytes, source.Length);
@@ -694,20 +499,13 @@ public sealed class HardwareMonitorService : IDisposable
 
         byte[] buffer = new byte[bytesToKeep];
         int bytesRead = source.Read(buffer, 0, buffer.Length);
-        if (bytesRead <= 0)
-        {
-            return;
-        }
+        if (bytesRead <= 0) return;
 
         int startIndex = Array.IndexOf(buffer, (byte)'\n');
         if (startIndex < 0 || startIndex >= bytesRead - 1)
-        {
             startIndex = 0;
-        }
         else
-        {
             startIndex++;
-        }
 
         File.WriteAllBytes(_logPath, buffer[startIndex..bytesRead]);
     }

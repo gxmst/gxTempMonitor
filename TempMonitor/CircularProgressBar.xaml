@@ -14,7 +14,7 @@
                  Opacity="0.95"/>
 
         <Path x:Name="ProgressPath"
-              StrokeThickness="10"
+              StrokeThickness="{Binding ArcStrokeThickness, ElementName=Root}"
               StrokeStartLineCap="Round"
               StrokeEndLineCap="Round">
             <Path.Effect>

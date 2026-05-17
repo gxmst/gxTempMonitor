@@ -38,11 +38,8 @@ public partial class MainWindow : Window
     private const double FullWidth = 205;
     private const double AnimDurationMs = 200;
     private const double MaxContainerWidth = 60;
-    private const double IdleBackgroundOpacity = 0.6;
-    private const double IdleTextOpacity = 0.7;
-
-    private static readonly System.Windows.Media.Brush WarningBrush = CreateFrozenBrush("#FFA500");
-    private static readonly System.Windows.Media.Brush CriticalBrush = CreateFrozenBrush("#FF4444");
+    private const double IdleBackgroundOpacity = 0.78;
+    private const double IdleTextOpacity = 0.84;
 
     private readonly string _configPath;
     private DispatcherTimer? _idleTimer;
@@ -129,44 +126,36 @@ public partial class MainWindow : Window
     {
         CpuUsageText.Text = $"{snapshot.CpuUsage:0.0} %";
         CpuMaxText.Text = $"{snapshot.CpuUsageMax:0.0} %";
-        CpuUsageText.Foreground = GetAlertBrush(snapshot.CpuUsage);
+        CpuUsageText.Foreground = UiHelper.GetAlertBrush(snapshot.CpuUsage);
         UpdateIndicator(CpuIndicator, snapshot.CpuUsage);
 
         if (snapshot.GpuTemperature.HasValue)
         {
             GpuTempText.Text = $"{snapshot.GpuTemperature.Value:0.0} °C";
             GpuMaxText.Text = $"{(snapshot.GpuTemperatureMax ?? snapshot.GpuTemperature.Value):0.0} °C";
-            GpuTempText.Foreground = GetAlertBrush(snapshot.GpuTemperature.Value);
+            GpuTempText.Foreground = UiHelper.GetAlertBrush(snapshot.GpuTemperature.Value);
             UpdateIndicator(GpuIndicator, snapshot.GpuTemperature.Value);
         }
         else
         {
             GpuTempText.Text = "-- °C";
             GpuMaxText.Text = "-- °C";
-            GpuTempText.Foreground = System.Windows.Media.Brushes.White;
+            GpuTempText.Foreground = UiHelper.NormalBrush;
             UpdateIndicator(GpuIndicator, 0);
         }
 
         RamUsedText.Text = $"{snapshot.RamUsedGb:F1} GB";
         RamMaxText.Text = $"{snapshot.RamUsedMaxGb:F1} GB";
-        RamUsedText.Foreground = GetAlertBrush(snapshot.RamUsagePercent);
+        RamUsedText.Foreground = UiHelper.GetAlertBrush(snapshot.RamUsagePercent);
         UpdateIndicator(RamIndicator, snapshot.RamUsagePercent);
 
-        if (snapshot.VramUsedGb.HasValue)
-        {
-            VramUsedText.Text = $"{snapshot.VramUsedGb.Value:F1} GB";
-            VramMaxText.Text = $"{(snapshot.VramUsedMaxGb ?? snapshot.VramUsedGb.Value):F1} GB";
-        }
-        else
-        {
-            VramUsedText.Text = "-- GB";
-            VramMaxText.Text = "-- GB";
-        }
+        VramUsedText.Text = UiHelper.FormatOptionalGb(snapshot.VramUsedGb);
+        VramMaxText.Text = UiHelper.FormatOptionalGb(snapshot.VramUsedMaxGb);
 
-        NetUpText.Text = FormatSpeed(snapshot.NetUploadBytesPerSecond);
-        NetUpMaxText.Text = FormatSpeed(snapshot.NetUploadMaxBytesPerSecond);
-        NetDownText.Text = FormatSpeed(snapshot.NetDownloadBytesPerSecond);
-        NetDownMaxText.Text = FormatSpeed(snapshot.NetDownloadMaxBytesPerSecond);
+        NetUpText.Text = UiHelper.FormatSpeed(snapshot.NetUploadBytesPerSecond);
+        NetUpMaxText.Text = UiHelper.FormatSpeed(snapshot.NetUploadMaxBytesPerSecond);
+        NetDownText.Text = UiHelper.FormatSpeed(snapshot.NetDownloadBytesPerSecond);
+        NetDownMaxText.Text = UiHelper.FormatSpeed(snapshot.NetDownloadMaxBytesPerSecond);
     }
 
     private void SetLock(bool lockIt)
@@ -236,8 +225,9 @@ public partial class MainWindow : Window
 
             ApplyVisibilitySettings();
         }
-        catch
+        catch (Exception ex)
         {
+            Debug.WriteLine($"加载配置失败: {ex.Message}");
         }
     }
 
@@ -257,8 +247,9 @@ public partial class MainWindow : Window
                 ShowDownload = _showDownload
             }));
         }
-        catch
+        catch (Exception ex)
         {
+            Debug.WriteLine($"保存配置失败: {ex.Message}");
         }
     }
 
@@ -364,7 +355,14 @@ public partial class MainWindow : Window
         string path = GetStartupShortcutPath();
         if (File.Exists(path))
         {
-            File.Delete(path);
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                System.Windows.MessageBox.Show($"删除自启快捷方式失败: {ex.Message}");
+            }
         }
         else
         {
@@ -380,10 +378,12 @@ public partial class MainWindow : Window
                 shortcut.TargetPath = exePath;
                 shortcut.WorkingDirectory = Path.GetDirectoryName(exePath);
                 shortcut.Save();
+                Marshal.ReleaseComObject(shortcut);
+                Marshal.ReleaseComObject(shell);
             }
             catch (Exception ex)
             {
-                System.Windows.MessageBox.Show("失败: " + ex.Message);
+                System.Windows.MessageBox.Show("创建自启快捷方式失败: " + ex.Message);
             }
         }
 
@@ -471,57 +471,19 @@ public partial class MainWindow : Window
     {
         if (value >= 90)
         {
-            indicator.Background = CriticalBrush;
+            indicator.Background = UiHelper.CriticalBrush;
             indicator.Opacity = 1;
             return;
         }
 
         if (value >= 80)
         {
-            indicator.Background = WarningBrush;
+            indicator.Background = UiHelper.WarningBrush;
             indicator.Opacity = 1;
             return;
         }
 
         indicator.Opacity = 0;
-    }
-
-    private static System.Windows.Media.Brush CreateFrozenBrush(string colorHex)
-    {
-        var brush = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(colorHex));
-        brush.Freeze();
-        return brush;
-    }
-
-    private static System.Windows.Media.Brush GetAlertBrush(float value)
-    {
-        if (value >= 90)
-        {
-            return CriticalBrush;
-        }
-
-        if (value >= 80)
-        {
-            return WarningBrush;
-        }
-
-        return System.Windows.Media.Brushes.White;
-    }
-
-    private static string FormatSpeed(float bytesPerSecond)
-    {
-        if (bytesPerSecond < 1024)
-        {
-            return $"{bytesPerSecond:0.0}B";
-        }
-
-        float kb = bytesPerSecond / 1024;
-        if (kb < 1024)
-        {
-            return $"{kb:0.0}K";
-        }
-
-        return $"{kb / 1024.0:0.1}M";
     }
 
     private void Window_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)

@@ -13,10 +13,15 @@
     <Window.Resources>
         <Style x:Key="LabelStyle" TargetType="TextBlock">
             <Setter Property="FontSize" Value="9"/>
-            <Setter Property="Foreground" Value="#8FB0B8C3"/>
+            <Setter Property="Foreground" Value="#FFD6DEE8"/>
             <Setter Property="Width" Value="35"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Effect">
+                <Setter.Value>
+                    <DropShadowEffect BlurRadius="3" ShadowDepth="0" Color="#F2000000" Opacity="1"/>
+                </Setter.Value>
+            </Setter>
         </Style>
 
         <Style x:Key="ValueStyle" TargetType="TextBlock">
@@ -29,13 +34,13 @@
             <Setter Property="VerticalAlignment" Value="Center"/>
             <Setter Property="Effect">
                 <Setter.Value>
-                    <DropShadowEffect BlurRadius="5" ShadowDepth="0" Color="#E0000000" Opacity="1"/>
+                    <DropShadowEffect BlurRadius="3" ShadowDepth="0" Color="#F4000000" Opacity="1"/>
                 </Setter.Value>
             </Setter>
         </Style>
 
         <Style x:Key="MaxStyle" TargetType="TextBlock" BasedOn="{StaticResource ValueStyle}">
-            <Setter Property="Foreground" Value="#FFE1B84A"/>
+            <Setter Property="Foreground" Value="#FFFFD36B"/>
             <Setter Property="FontSize" Value="10"/>
             <Setter Property="Margin" Value="10,0,0,0"/>
         </Style>
@@ -76,11 +81,11 @@
     </Window.ContextMenu>
 
     <Border x:Name="MainBorder"
-            BorderBrush="#24F2F6FF" BorderThickness="1" CornerRadius="7"
+            BorderBrush="#3AF2F6FF" BorderThickness="1" CornerRadius="7"
             Padding="9,5" HorizontalAlignment="Right" Width="135"
             MouseEnter="MainBorder_MouseEnter" MouseLeave="MainBorder_MouseLeave">
         <Border.Background>
-            <SolidColorBrush x:Name="MainBackgroundBrush" Color="#96101214"/>
+            <SolidColorBrush x:Name="MainBackgroundBrush" Color="#B014171C"/>
         </Border.Background>
         <Grid>
             <StackPanel x:Name="MainStack">
@@ -90,7 +95,7 @@
                         <ColumnDefinition Width="60"/>
                         <ColumnDefinition Width="60"/>
                     </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="2" Text="MAX" Foreground="#D8E1B84A" FontSize="8" FontWeight="Bold" Margin="10,0,0,0"/>
+                    <TextBlock Grid.Column="2" Text="MAX" Foreground="#F0FFD36B" FontSize="8" FontWeight="Bold" Margin="10,0,0,0"/>
                 </Grid>
 
                 <Grid Margin="0,1" x:Name="CpuRow" Background="Transparent">
@@ -155,7 +160,7 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="UP ↑" Style="{StaticResource LabelStyle}"/>
-                    <TextBlock x:Name="NetUpText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="#FF9F6E6E" FontSize="10"/>
+                    <TextBlock x:Name="NetUpText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="#FFFFB3A7" FontSize="10"/>
                     <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
                         <TextBlock x:Name="NetUpMaxText" Text="0.0K" Style="{StaticResource MaxStyle}" FontSize="10"/>
                     </Border>
@@ -168,7 +173,7 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="DW ↓" Style="{StaticResource LabelStyle}"/>
-                    <TextBlock x:Name="NetDownText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="#7ED89C" FontSize="10"/>
+                    <TextBlock x:Name="NetDownText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="#FF9FF3C6" FontSize="10"/>
                     <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
                         <TextBlock x:Name="NetDownMaxText" Text="0.0K" Style="{StaticResource MaxStyle}" FontSize="10"/>
                     </Border>

@@ -27,6 +27,10 @@ public partial class CircularProgressBar : System.Windows.Controls.UserControl
         DependencyProperty.Register(nameof(Caption), typeof(string), typeof(CircularProgressBar),
             new PropertyMetadata(string.Empty));
 
+    public static readonly DependencyProperty ArcStrokeThicknessProperty =
+        DependencyProperty.Register(nameof(ArcStrokeThickness), typeof(double), typeof(CircularProgressBar),
+            new PropertyMetadata(10d, OnVisualPropertyChanged));
+
     public double Value
     {
         get => (double)GetValue(ValueProperty);
@@ -55,6 +59,12 @@ public partial class CircularProgressBar : System.Windows.Controls.UserControl
     {
         get => (string)GetValue(CaptionProperty);
         set => SetValue(CaptionProperty, value);
+    }
+
+    public double ArcStrokeThickness
+    {
+        get => (double)GetValue(ArcStrokeThicknessProperty);
+        set => SetValue(ArcStrokeThicknessProperty, value);
     }
 
     public CircularProgressBar()
@@ -89,7 +99,9 @@ public partial class CircularProgressBar : System.Windows.Controls.UserControl
             return;
         }
 
-        const double strokeThickness = 10;
+        double strokeThickness = ArcStrokeThickness;
+        ProgressPath.StrokeThickness = strokeThickness;
+
         double radius = (size - strokeThickness) / 2;
         System.Windows.Point center = new(size / 2, size / 2);
         double startAngle = -90;

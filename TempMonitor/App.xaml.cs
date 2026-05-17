@@ -29,7 +29,18 @@ public partial class App : System.Windows.Application
     protected override void OnExit(ExitEventArgs e)
     {
         HardwareMonitorService.Instance.Dispose();
-        _singleInstanceMutex?.ReleaseMutex();
+
+        try
+        {
+            _singleInstanceMutex?.ReleaseMutex();
+        }
+        catch (AbandonedMutexException)
+        {
+        }
+        catch (ApplicationException)
+        {
+        }
+
         _singleInstanceMutex?.Dispose();
         _singleInstanceMutex = null;
         base.OnExit(e);

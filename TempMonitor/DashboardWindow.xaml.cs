@@ -22,10 +22,6 @@ public partial class DashboardWindow : Window
     private readonly Queue<double> _upTrend = new();
     private readonly Queue<double> _downTrend = new();
 
-    private static readonly System.Windows.Media.Brush WarningBrush = CreateBrush("#FFA500");
-    private static readonly System.Windows.Media.Brush CriticalBrush = CreateBrush("#FF4444");
-    private static readonly System.Windows.Media.Brush NormalBrush = CreateBrush("#F7F9FC");
-
     public DashboardWindow()
     {
         InitializeComponent();
@@ -68,131 +64,137 @@ public partial class DashboardWindow : Window
         PushTrend(_upTrend, snapshot.NetUploadBytesPerSecond);
         PushTrend(_downTrend, snapshot.NetDownloadBytesPerSecond);
 
-        AnimateGauge(CpuGauge, snapshot.CpuUsage);
-        CpuTempValueText.Text = snapshot.CpuTemperature.HasValue
-            ? $"温度 {snapshot.CpuTemperature.Value:0.0} °C"
-            : "温度 --";
+        ApplyOverviewSnapshot(snapshot);
+        ApplyCpuDetailSnapshot(snapshot);
+        ApplyGpuDetailSnapshot(snapshot);
+        ApplyRamDetailSnapshot(snapshot);
+        ApplyNetworkDetailSnapshot(snapshot);
+        ApplyTrendSnapshot(snapshot);
+    }
 
-        AnimateGauge(GpuGauge, snapshot.GpuUsagePercent);
-        GpuTempValueText.Text = snapshot.GpuTemperature.HasValue
-            ? $"{snapshot.GpuTemperature.Value:0.0} °C"
-            : "-- °C";
-        GpuTempValueText.Foreground = GetAlertBrush(snapshot.GpuTemperature ?? 0);
-        GpuVramValueText.Text = snapshot.VramUsedGb.HasValue
-            ? $"显存 {snapshot.VramUsedGb.Value:F1} GB"
+    private void ApplyOverviewSnapshot(HardwareSnapshot s)
+    {
+        AnimateGauge(CpuGauge, s.CpuUsage);
+        CpuTempValueText.Text = "温度 --";
+
+        AnimateGauge(GpuGauge, s.GpuUsagePercent);
+        GpuTempValueText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperature);
+        GpuTempValueText.Foreground = UiHelper.GetAlertBrush(s.GpuTemperature ?? 0);
+        GpuVramValueText.Text = s.VramUsedGb.HasValue
+            ? $"显存 {s.VramUsedGb.Value:F1} GB"
             : "显存 --";
 
-        AnimateGauge(RamGauge, snapshot.RamUsagePercent);
-        RamUsedValueText.Text = $"{snapshot.RamUsedGb:F1} / {snapshot.TotalRamGb:F1} GB";
-        RamPercentValueText.Text = $"使用率 {snapshot.RamUsagePercent:0.0} %";
+        AnimateGauge(RamGauge, s.RamUsagePercent);
+        RamUsedValueText.Text = $"{s.RamUsedGb:F1} / {s.TotalRamGb:F1} GB";
+        RamPercentValueText.Text = $"使用率 {s.RamUsagePercent:0.0} %";
 
-        NetDownValueText.Text = $"↓ {FormatSpeed(snapshot.NetDownloadBytesPerSecond)}";
-        NetUpValueText.Text = $"↑ {FormatSpeed(snapshot.NetUploadBytesPerSecond)}";
-        float networkActivity = Math.Min(100, (snapshot.NetDownloadBytesPerSecond + snapshot.NetUploadBytesPerSecond) / 1024f / 1024f * 10f);
+        NetDownValueText.Text = $"↓ {UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond)}";
+        NetUpValueText.Text = $"↑ {UiHelper.FormatSpeed(s.NetUploadBytesPerSecond)}";
+        float networkActivity = Math.Min(100, (s.NetDownloadBytesPerSecond + s.NetUploadBytesPerSecond) / 1024f / 1024f * 10f);
         AnimateProgressBar(NetActivityProgressBar, networkActivity);
-        TrendCpuValueText.Text = $"{snapshot.CpuUsage:0.0} %";
-        TrendGpuValueText.Text = snapshot.GpuTemperature.HasValue ? $"{snapshot.GpuTemperature.Value:0.0} °C" : "-- °C";
-        TrendRamValueText.Text = $"{snapshot.RamUsedGb:F1} GB";
-        TrendVramValueText.Text = snapshot.VramUsedGb.HasValue ? $"{snapshot.VramUsedGb.Value:F1} GB" : "--";
-        TrendUpValueText.Text = FormatSpeed(snapshot.NetUploadBytesPerSecond);
-        TrendDownValueText.Text = FormatSpeed(snapshot.NetDownloadBytesPerSecond);
+    }
+
+    private void ApplyTrendSnapshot(HardwareSnapshot s)
+    {
+        TrendCpuValueText.Text = $"{s.CpuUsage:0.0} %";
+        TrendGpuValueText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperature);
+        TrendRamValueText.Text = $"{s.RamUsedGb:F1} GB";
+        TrendVramValueText.Text = s.VramUsedGb.HasValue ? $"{s.VramUsedGb.Value:F1} GB" : "--";
+        TrendUpValueText.Text = UiHelper.FormatSpeed(s.NetUploadBytesPerSecond);
+        TrendDownValueText.Text = UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond);
         TrendCpuChart.Values = _cpuTrend.ToArray();
         TrendGpuChart.Values = _gpuTrend.ToArray();
         TrendRamChart.Values = _ramTrend.ToArray();
         TrendVramChart.Values = _vramTrend.ToArray();
         TrendUpChart.Values = _upTrend.ToArray();
         TrendDownChart.Values = _downTrend.ToArray();
+    }
 
-        RamDetailUsedText.Text = $"{snapshot.RamUsedGb:F1} / {snapshot.TotalRamGb:F1} GB";
-        RamDetailUsedText.Foreground = GetAlertBrush(snapshot.RamUsagePercent);
-        RamDetailPercentText.Text = $"使用率 {snapshot.RamUsagePercent:0.0} %";
-        RamDetailAvailableText.Text = $"{snapshot.RamAvailableGb:F1} GB";
-        RamDetailTotalText.Text = $"总内存 {snapshot.TotalRamGb:F1} GB";
-        RamDetailPeakText.Text = $"{snapshot.RamUsedMaxGb:F1} GB";
-        RamDetailHeadroomText.Text = $"{snapshot.RamAvailableGb:F1} GB";
-        RamDetailPercentChipText.Text = $"{snapshot.RamUsagePercent:0.0} %";
-        RamDetailAvailChipText.Text = $"{snapshot.RamAvailableGb:F1} GB";
-        RamDetailUsedFootText.Text = $"{snapshot.RamUsedGb:F1} GB";
-        RamDetailAvailFootText.Text = $"{snapshot.RamAvailableGb:F1} GB";
-        RamDetailPeakFootText.Text = $"{snapshot.RamUsedMaxGb:F1} GB";
-        RamDetailPercentFootText.Text = $"{snapshot.RamUsagePercent:0.0} %";
-        AnimateProgressBar(RamDetailUsageProgressBar, snapshot.RamUsagePercent);
+    private void ApplyCpuDetailSnapshot(HardwareSnapshot s)
+    {
+        CpuDetailUsageText.Text = $"{s.CpuUsage:0.0} %";
+        CpuDetailUsageText.Foreground = UiHelper.GetAlertBrush(s.CpuUsage);
+        CpuDetailClockText.Text = "频率 --";
+        CpuDetailTemperatureText.Text = "--";
+        CpuDetailPowerText.Text = "功耗 --";
 
-        NetworkDetailDownText.Text = $"↓ {FormatSpeed(snapshot.NetDownloadBytesPerSecond)}";
-        NetworkDetailUpText.Text = $"↑ {FormatSpeed(snapshot.NetUploadBytesPerSecond)}";
-        NetworkDetailInterfaceText.Text = string.IsNullOrWhiteSpace(snapshot.NetworkInterfaceName)
-            ? "未识别"
-            : snapshot.NetworkInterfaceName;
-        NetworkDetailTotalText.Text = $"总吞吐 {FormatSpeed(snapshot.NetTotalBytesPerSecond)}";
-        NetworkDetailPeakUpText.Text = FormatSpeed(snapshot.NetUploadMaxBytesPerSecond);
-        NetworkDetailPeakDownText.Text = FormatSpeed(snapshot.NetDownloadMaxBytesPerSecond);
-        NetworkDetailDownChipText.Text = FormatSpeed(snapshot.NetDownloadBytesPerSecond);
-        NetworkDetailUpChipText.Text = FormatSpeed(snapshot.NetUploadBytesPerSecond);
-        NetworkDetailInterfaceFootText.Text = string.IsNullOrWhiteSpace(snapshot.NetworkInterfaceName) ? "未识别" : snapshot.NetworkInterfaceName;
-        NetworkDetailTotalFootText.Text = FormatSpeed(snapshot.NetTotalBytesPerSecond);
-        NetworkDetailDownFootText.Text = FormatSpeed(snapshot.NetDownloadBytesPerSecond);
-        NetworkDetailUpFootText.Text = FormatSpeed(snapshot.NetUploadBytesPerSecond);
-        AnimateProgressBar(NetworkDetailActivityProgressBar, networkActivity);
+        CpuDetailMaxUsageText.Text = $"{s.CpuUsageMax:0.0} %";
+        CpuDetailMaxTempText.Text = "--";
+        CpuDetailClockChipText.Text = "--";
+        CpuDetailPowerChipText.Text = "--";
+        CpuDetailUsageFootText.Text = $"{s.CpuUsage:0.0} %";
+        CpuDetailTempFootText.Text = "--";
+        CpuDetailPowerFootText.Text = "--";
+        CpuDetailFreqFootText.Text = "--";
+        AnimateProgressBar(CpuDetailUsageProgressBar, s.CpuUsage);
+    }
 
-        CpuDetailUsageText.Text = $"{snapshot.CpuUsage:0.0} %";
-        CpuDetailUsageText.Foreground = GetAlertBrush(snapshot.CpuUsage);
-        CpuDetailClockText.Text = snapshot.CpuClockMhz.HasValue
-            ? $"频率 {snapshot.CpuClockMhz.Value:0} MHz"
-            : "频率 --";
-        CpuDetailTemperatureText.Text = snapshot.CpuTemperature.HasValue
-            ? $"{snapshot.CpuTemperature.Value:0.0} °C"
-            : "-- °C";
-        CpuDetailTemperatureText.Foreground = GetAlertBrush(snapshot.CpuTemperature ?? 0);
-        CpuDetailPowerText.Text = snapshot.CpuPackagePowerWatts.HasValue
-            ? $"功耗 {snapshot.CpuPackagePowerWatts.Value:0.0} W"
-            : "功耗 --";
-        string cpuClockText = snapshot.CpuClockMhz.HasValue ? $"{snapshot.CpuClockMhz.Value:0} MHz" : "--";
-        string cpuPowerText = snapshot.CpuPackagePowerWatts.HasValue ? $"{snapshot.CpuPackagePowerWatts.Value:0.0} W" : "--";
-        string cpuTempText = snapshot.CpuTemperature.HasValue ? $"{snapshot.CpuTemperature.Value:0.0} °C" : "-- °C";
-        CpuDetailMaxUsageText.Text = $"{snapshot.CpuUsageMax:0.0} %";
-        CpuDetailMaxTempText.Text = snapshot.CpuTemperatureMax.HasValue
-            ? $"{snapshot.CpuTemperatureMax.Value:0.0} °C"
-            : "-- °C";
-        CpuDetailClockChipText.Text = cpuClockText;
-        CpuDetailPowerChipText.Text = cpuPowerText;
-        CpuDetailUsageFootText.Text = $"{snapshot.CpuUsage:0.0} %";
-        CpuDetailTempFootText.Text = cpuTempText;
-        CpuDetailPowerFootText.Text = cpuPowerText;
-        CpuDetailFreqFootText.Text = cpuClockText;
-        AnimateProgressBar(CpuDetailUsageProgressBar, snapshot.CpuUsage);
-
-        GpuDetailUsageText.Text = $"{snapshot.GpuUsagePercent:0.0} %";
-        GpuDetailUsageText.Foreground = GetAlertBrush(snapshot.GpuUsagePercent);
-        GpuDetailVramText.Text = snapshot.VramUsedGb.HasValue
-            ? $"显存 {snapshot.VramUsedGb.Value:F1} GB"
+    private void ApplyGpuDetailSnapshot(HardwareSnapshot s)
+    {
+        GpuDetailUsageText.Text = $"{s.GpuUsagePercent:0.0} %";
+        GpuDetailUsageText.Foreground = UiHelper.GetAlertBrush(s.GpuUsagePercent);
+        GpuDetailVramText.Text = s.VramUsedGb.HasValue
+            ? $"显存 {s.VramUsedGb.Value:F1} GB"
             : "显存 --";
-        GpuDetailMemoryValueText.Text = FormatOptionalGb(snapshot.VramUsedGb);
-        GpuDetailTemperatureText.Text = snapshot.GpuTemperature.HasValue
-            ? $"{snapshot.GpuTemperature.Value:0.0} °C"
-            : "-- °C";
-        GpuDetailTemperatureText.Foreground = GetAlertBrush(snapshot.GpuTemperature ?? 0);
-        GpuDetailPowerText.Text = snapshot.GpuPowerWatts.HasValue
-            ? $"功耗 {snapshot.GpuPowerWatts.Value:0.0} W"
+        GpuDetailMemoryValueText.Text = UiHelper.FormatOptionalGb(s.VramUsedGb);
+        GpuDetailTemperatureText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperature);
+        GpuDetailTemperatureText.Foreground = UiHelper.GetAlertBrush(s.GpuTemperature ?? 0);
+        GpuDetailPowerText.Text = s.GpuPowerWatts.HasValue
+            ? $"功耗 {s.GpuPowerWatts.Value:0.0} W"
             : "功耗 --";
-        GpuDetailFanText.Text = snapshot.GpuFanRpm.HasValue
-            ? $"风扇 {snapshot.GpuFanRpm.Value:0} RPM"
-            : "风扇 --";
-        string gpuPowerText = snapshot.GpuPowerWatts.HasValue ? $"{snapshot.GpuPowerWatts.Value:0.0} W" : "--";
-        string gpuFanText = snapshot.GpuFanRpm.HasValue ? $"{snapshot.GpuFanRpm.Value:0} RPM" : "--";
-        string gpuTempText = snapshot.GpuTemperature.HasValue ? $"{snapshot.GpuTemperature.Value:0.0} °C" : "-- °C";
-        GpuDetailMaxTempText.Text = snapshot.GpuTemperatureMax.HasValue
-            ? $"{snapshot.GpuTemperatureMax.Value:0.0} °C"
-            : "-- °C";
+        GpuDetailFanText.Text = "风扇 --";
+
+        string gpuPowerText = s.GpuPowerWatts.HasValue ? $"{s.GpuPowerWatts.Value:0.0} W" : "--";
+        string gpuFanText = "--";
+        string gpuTempText = UiHelper.FormatOptionalTemp(s.GpuTemperature, "--");
+
+        GpuDetailMaxTempText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperatureMax);
         GpuDetailFanChipText.Text = gpuFanText;
         GpuDetailPowerChipText.Text = gpuPowerText;
-        GpuDetailUsageFootText.Text = $"{snapshot.GpuUsagePercent:0.0} %";
+        GpuDetailUsageFootText.Text = $"{s.GpuUsagePercent:0.0} %";
         GpuDetailTempFootText.Text = gpuTempText;
         GpuDetailPowerFootText.Text = gpuPowerText;
         GpuDetailFanFootText.Text = gpuFanText;
-        AnimateProgressBar(GpuDetailUsageProgressBar, snapshot.GpuUsagePercent);
+        AnimateProgressBar(GpuDetailUsageProgressBar, s.GpuUsagePercent);
     }
 
-    private static string FormatOptionalGb(float? value) => value.HasValue ? $"{value.Value:F1} GB" : "--";
+    private void ApplyRamDetailSnapshot(HardwareSnapshot s)
+    {
+        RamDetailUsedText.Text = $"{s.RamUsedGb:F1} / {s.TotalRamGb:F1} GB";
+        RamDetailUsedText.Foreground = UiHelper.GetAlertBrush(s.RamUsagePercent);
+        RamDetailPercentText.Text = $"使用率 {s.RamUsagePercent:0.0} %";
+        RamDetailAvailableText.Text = $"{s.RamAvailableGb:F1} GB";
+        RamDetailTotalText.Text = $"总内存 {s.TotalRamGb:F1} GB";
+        RamDetailPeakText.Text = $"{s.RamUsedMaxGb:F1} GB";
+        RamDetailHeadroomText.Text = $"{s.RamAvailableGb:F1} GB";
+        RamDetailPercentChipText.Text = $"{s.RamUsagePercent:0.0} %";
+        RamDetailAvailChipText.Text = $"{s.RamAvailableGb:F1} GB";
+        RamDetailUsedFootText.Text = $"{s.RamUsedGb:F1} GB";
+        RamDetailAvailFootText.Text = $"{s.RamAvailableGb:F1} GB";
+        RamDetailPeakFootText.Text = $"{s.RamUsedMaxGb:F1} GB";
+        RamDetailPercentFootText.Text = $"{s.RamUsagePercent:0.0} %";
+        AnimateProgressBar(RamDetailUsageProgressBar, s.RamUsagePercent);
+    }
+
+    private void ApplyNetworkDetailSnapshot(HardwareSnapshot s)
+    {
+        NetworkDetailDownText.Text = $"↓ {UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond)}";
+        NetworkDetailUpText.Text = $"↑ {UiHelper.FormatSpeed(s.NetUploadBytesPerSecond)}";
+        NetworkDetailInterfaceText.Text = string.IsNullOrWhiteSpace(s.NetworkInterfaceName)
+            ? "未识别"
+            : s.NetworkInterfaceName;
+        NetworkDetailTotalText.Text = $"总吞吐 {UiHelper.FormatSpeed(s.NetTotalBytesPerSecond)}";
+        NetworkDetailPeakUpText.Text = UiHelper.FormatSpeed(s.NetUploadMaxBytesPerSecond);
+        NetworkDetailPeakDownText.Text = UiHelper.FormatSpeed(s.NetDownloadMaxBytesPerSecond);
+        NetworkDetailDownChipText.Text = UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond);
+        NetworkDetailUpChipText.Text = UiHelper.FormatSpeed(s.NetUploadBytesPerSecond);
+        NetworkDetailInterfaceFootText.Text = string.IsNullOrWhiteSpace(s.NetworkInterfaceName) ? "未识别" : s.NetworkInterfaceName;
+        NetworkDetailTotalFootText.Text = UiHelper.FormatSpeed(s.NetTotalBytesPerSecond);
+        NetworkDetailDownFootText.Text = UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond);
+        NetworkDetailUpFootText.Text = UiHelper.FormatSpeed(s.NetUploadBytesPerSecond);
+        float networkActivity = Math.Min(100, (s.NetDownloadBytesPerSecond + s.NetUploadBytesPerSecond) / 1024f / 1024f * 10f);
+        AnimateProgressBar(NetworkDetailActivityProgressBar, networkActivity);
+    }
 
     private static void PushTrend(Queue<double> queue, double value)
     {
@@ -225,44 +227,6 @@ public partial class DashboardWindow : Window
         };
 
         progressBar.BeginAnimation(System.Windows.Controls.Primitives.RangeBase.ValueProperty, animation, HandoffBehavior.SnapshotAndReplace);
-    }
-
-    private static System.Windows.Media.Brush CreateBrush(string colorHex)
-    {
-        var brush = new SolidColorBrush((System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString(colorHex));
-        brush.Freeze();
-        return brush;
-    }
-
-    private static System.Windows.Media.Brush GetAlertBrush(float value)
-    {
-        if (value >= 90)
-        {
-            return CriticalBrush;
-        }
-
-        if (value >= 80)
-        {
-            return WarningBrush;
-        }
-
-        return NormalBrush;
-    }
-
-    private static string FormatSpeed(float bytesPerSecond)
-    {
-        if (bytesPerSecond < 1024)
-        {
-            return $"{bytesPerSecond:0.0}B";
-        }
-
-        float kb = bytesPerSecond / 1024;
-        if (kb < 1024)
-        {
-            return $"{kb:0.0}K";
-        }
-
-        return $"{kb / 1024.0:0.1}M";
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
