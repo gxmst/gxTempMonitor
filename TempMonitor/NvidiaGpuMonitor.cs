@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 
 namespace TempMonitor;
 
-internal sealed class VendorGpuMonitor : IDisposable
+internal sealed class NvidiaGpuMonitor : IGpuMonitor
 {
     private const int NvmlSuccess = 0;
     private const int NvmlTempGpu = 0;
@@ -53,7 +53,7 @@ internal sealed class VendorGpuMonitor : IDisposable
 
     public static bool IsNvmlAvailable => NvmlLib != IntPtr.Zero && NvmlInit != null;
 
-    static VendorGpuMonitor()
+    static NvidiaGpuMonitor()
     {
         NvmlLib = TryLoadNvmlLibrary();
         if (NvmlLib == IntPtr.Zero) return;
@@ -73,6 +73,7 @@ internal sealed class VendorGpuMonitor : IDisposable
     private bool _disposed;
 
     public bool Initialized => _initialized;
+    public string VendorName => "NVIDIA";
 
     public bool TryInitialize()
     {
@@ -105,10 +106,10 @@ internal sealed class VendorGpuMonitor : IDisposable
         }
     }
 
-    public (float? Temperature, float? Usage, float? VramUsedGb, float? VramTotalGb, float? PowerWatts) Read()
+    public GpuReading Read()
     {
         if (!_initialized || _disposed)
-            return (null, null, null, null, null);
+            return GpuReading.Empty;
 
         float? temp = null, usage = null, vramUsed = null, vramTotal = null, power = null;
 
@@ -134,7 +135,14 @@ internal sealed class VendorGpuMonitor : IDisposable
             _initialized = false;
         }
 
-        return (temp, usage, vramUsed, vramTotal, power);
+        return new GpuReading
+        {
+            Temperature = temp,
+            Usage = usage,
+            VramUsedGb = vramUsed,
+            VramTotalGb = vramTotal,
+            PowerWatts = power
+        };
     }
 
     public void Dispose()

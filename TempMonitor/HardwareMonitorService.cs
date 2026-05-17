@@ -82,7 +82,8 @@ public sealed class HardwareMonitorService : IDisposable
     private PerformanceCounter? _cpuCounter;
     private PerformanceCounter? _recvCounter;
     private PerformanceCounter? _sentCounter;
-    private VendorGpuMonitor? _vendorGpuMonitor;
+    private IGpuMonitor? _gpuMonitor;
+    private WindowsGpuCounterMonitor? _vramFallback;
     private string? _interfaceName;
     private int _zeroTrafficSeconds;
     private int _networkRefreshCounter = InterfaceRefreshIntervalSeconds;
@@ -146,8 +147,10 @@ public sealed class HardwareMonitorService : IDisposable
             _cpuCounter?.Dispose();
             _recvCounter?.Dispose();
             _sentCounter?.Dispose();
-            _vendorGpuMonitor?.Dispose();
-            _vendorGpuMonitor = null;
+            _gpuMonitor?.Dispose();
+            _gpuMonitor = null;
+            _vramFallback?.Dispose();
+            _vramFallback = null;
 
             foreach (PerformanceCounter counter in _trafficCounters.Values)
             {
@@ -190,8 +193,17 @@ public sealed class HardwareMonitorService : IDisposable
         {
             try
             {
-                _vendorGpuMonitor = new VendorGpuMonitor();
-                _vendorGpuMonitor.TryInitialize();
+                _gpuMonitor = TryCreateGpuMonitor();
+                _gpuMonitor?.TryInitialize();
+
+                if (_gpuMonitor is not WindowsGpuCounterMonitor)
+                {
+                    var fallback = new WindowsGpuCounterMonitor();
+                    if (fallback.TryInitialize())
+                        _vramFallback = fallback;
+                    else
+                        fallback.Dispose();
+                }
 
                 _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
                 _cpuCounter.NextValue();
@@ -232,13 +244,19 @@ public sealed class HardwareMonitorService : IDisposable
         float? gpuPowerWatts = null;
         float? vramGb = null;
 
-        if (_vendorGpuMonitor?.Initialized == true)
+        if (_gpuMonitor?.Initialized == true)
         {
-            var gpu = _vendorGpuMonitor.Read();
+            var gpu = _gpuMonitor.Read();
             gpuTemp = gpu.Temperature;
             gpuUsagePercent = gpu.Usage ?? 0;
             vramGb = gpu.VramUsedGb;
             gpuPowerWatts = gpu.PowerWatts;
+        }
+
+        if (vramGb == null && _vramFallback?.Initialized == true)
+        {
+            var fallback = _vramFallback.Read();
+            vramGb = fallback.VramUsedGb;
         }
 
         UpdateMax("CPU_USAGE", cpuUsage);
@@ -511,4 +529,30 @@ public sealed class HardwareMonitorService : IDisposable
     }
 
     private void ClearReportedError(string key) => _reportedErrors.Remove(key);
+
+    private static IGpuMonitor? TryCreateGpuMonitor()
+    {
+        if (NvidiaGpuMonitor.IsNvmlAvailable)
+        {
+            var nvidia = new NvidiaGpuMonitor();
+            if (nvidia.TryInitialize())
+                return nvidia;
+            nvidia.Dispose();
+        }
+
+        if (AmdGpuMonitor.IsAdlAvailable)
+        {
+            var amd = new AmdGpuMonitor();
+            if (amd.TryInitialize())
+                return amd;
+            amd.Dispose();
+        }
+
+        var windows = new WindowsGpuCounterMonitor();
+        if (windows.TryInitialize())
+            return windows;
+        windows.Dispose();
+
+        return null;
+    }
 }

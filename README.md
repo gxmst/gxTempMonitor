@@ -40,19 +40,27 @@ gxTempMonitor 的设计原则：**只用用户态 API，不加载任何内核驱
 
 ## 数据来源
 
+GPU 监控按优先级自动选择，无需手动配置：
+
+| 优先级 | 方案 | GPU 温度 | GPU 使用率 | 显存 | 功耗 | 适用显卡 |
+|--------|------|---------|-----------|------|------|---------|
+| 1 | NVIDIA NVML (`nvml.dll`) | ✅ | ✅ | ✅ | ✅ | NVIDIA |
+| 2 | AMD ADL (`atiadlxx.dll`) | ✅ | ✅ | ✅* | ✅ | AMD |
+| 3 | Windows GPU PerformanceCounter | ❌ | ✅ | ✅ | ❌ | 全部（含 Intel） |
+
+\* AMD ADL 返回显存总量，显存使用量由 Windows PerformanceCounter 补充。
+
+其他指标：
+
 | 指标 | 数据源 | 内核驱动 |
 |------|--------|---------|
-| GPU 温度 | NVIDIA NVML (`nvml.dll`) | ❌ |
-| GPU 使用率 | NVIDIA NVML | ❌ |
-| 显存使用 | NVIDIA NVML | ❌ |
-| GPU 功耗 | NVIDIA NVML | ❌ |
 | CPU 使用率 | Windows PerformanceCounter | ❌ |
 | 内存使用 | `GlobalMemoryStatusEx` | ❌ |
 | 网络流量 | Windows PerformanceCounter | ❌ |
 
 所有数据通过用户态 API 获取，不加载 WinRing0 等内核驱动，不触发反作弊检测。
 
-> NVIDIA GPU 通过 NVML 读取，需要系统已安装 NVIDIA 驱动。AMD GPU 暂不支持温度读取，显存和使用率后续可通过 ADLX 支持。
+> NVIDIA GPU 需要系统已安装 NVIDIA 驱动。AMD GPU 需要系统已安装 AMD 驱动（自带 `atiadlxx.dll`）。
 
 ## 交互
 
@@ -95,7 +103,10 @@ TempMonitor/
 ├── MainWindow.xaml(.cs)         悬浮挂件
 ├── DashboardWindow.xaml(.cs)    主控台
 ├── HardwareMonitorService.cs    硬件数据采集服务（单例）
-├── VendorGpuMonitor.cs          NVIDIA NVML 用户态 API 封装
+├── IGpuMonitor.cs               GPU 监控接口 + GpuReading 结构体
+├── NvidiaGpuMonitor.cs          NVIDIA NVML 用户态 API 封装
+├── AmdGpuMonitor.cs             AMD ADL 用户态 API 封装
+├── WindowsGpuCounterMonitor.cs  Windows GPU PerformanceCounter 兜底
 ├── UiHelper.cs                  UI 工具类（格式化、告警色）
 ├── CircularProgressBar.xaml(.cs) 环形仪表盘控件
 ├── SparklineChart.xaml(.cs)     趋势折线控件
@@ -106,6 +117,8 @@ TempMonitor/
 
 - .NET 10 / WPF
 - NVIDIA NVML（用户态 GPU 监控）
+- AMD ADL（用户态 GPU 监控）
+- Windows GPU PerformanceCounter（通用 GPU 兜底）
 - Windows PerformanceCounter（CPU / 网络）
 - `GlobalMemoryStatusEx`（内存）
 - 无第三方内核驱动依赖
