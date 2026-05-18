@@ -4,9 +4,12 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace TempMonitor;
+
+public record GpuProcessInfo(string ProcessName, long DedicatedBytes, long SharedBytes);
 
 public sealed class HardwareSnapshot
 {
@@ -30,6 +33,7 @@ public sealed class HardwareSnapshot
     public float NetUploadMaxBytesPerSecond { get; init; }
     public float NetDownloadBytesPerSecond { get; init; }
     public float NetDownloadMaxBytesPerSecond { get; init; }
+    public string? TopGpuProcess { get; init; }
 }
 
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
@@ -63,9 +67,12 @@ public sealed class HardwareMonitorService : IDisposable
     private const int ZeroTrafficRecheckSeconds = 5;
     private const int MaxLogBytes = 256 * 1024;
     private const int RetainedLogBytes = 128 * 1024;
+    private const int MaxHistoryEntries = 3600;
+    private const int ProcessRefreshInterval = 5;
 
     private readonly object _syncRoot = new();
     private readonly object _logLock = new();
+    private readonly List<HardwareSnapshot> _history = new();
     private readonly Dictionary<string, PerformanceCounter> _trafficCounters = new(StringComparer.Ordinal);
     private readonly Dictionary<string, float> _maxValues = new()
     {
@@ -87,6 +94,8 @@ public sealed class HardwareMonitorService : IDisposable
     private string? _interfaceName;
     private int _zeroTrafficSeconds;
     private int _networkRefreshCounter = InterfaceRefreshIntervalSeconds;
+    private int _processRefreshCounter = ProcessRefreshInterval;
+    private string? _cachedTopGpuProcess;
     private bool _disposed;
 
     private CancellationTokenSource? _cts;
@@ -121,6 +130,26 @@ public sealed class HardwareMonitorService : IDisposable
             {
                 _maxValues[key] = 0;
             }
+        }
+    }
+
+    public string ExportCsv()
+    {
+        lock (_logLock)
+        {
+            if (_history.Count == 0)
+                return "Timestamp,CPU Usage %,GPU Temp °C,GPU Usage %,RAM Used GB,RAM Usage %,VRAM Used GB,Upload B/s,Download B/s,Top GPU Process";
+
+            var sb = new StringBuilder();
+            sb.AppendLine("Timestamp,CPU Usage %,GPU Temp °C,GPU Usage %,RAM Used GB,RAM Usage %,VRAM Used GB,Upload B/s,Download B/s,Top GPU Process");
+            foreach (var s in _history)
+            {
+                var gpuTemp = s.GpuTemperature.HasValue ? $"{s.GpuTemperature.Value:0.0}" : "";
+                var vram = s.VramUsedGb.HasValue ? $"{s.VramUsedGb.Value:F1}" : "";
+                var topProc = s.TopGpuProcess ?? "";
+                sb.AppendLine($"{s.Timestamp:yyyy-MM-dd HH:mm:ss},{s.CpuUsage:0.0},{gpuTemp},{s.GpuUsagePercent:0.0},{s.RamUsedGb:F1},{s.RamUsagePercent:0.0},{vram},{s.NetUploadBytesPerSecond:0},{s.NetDownloadBytesPerSecond:0},{topProc}");
+            }
+            return sb.ToString();
         }
     }
 
@@ -230,6 +259,13 @@ public sealed class HardwareMonitorService : IDisposable
             LatestSnapshot = snapshot;
         }
 
+        lock (_logLock)
+        {
+            _history.Add(snapshot);
+            while (_history.Count > MaxHistoryEntries)
+                _history.RemoveAt(0);
+        }
+
         DataUpdated?.Invoke(snapshot);
     }
 
@@ -266,6 +302,13 @@ public sealed class HardwareMonitorService : IDisposable
         UpdateMax("UP", upload);
         UpdateMax("DOWN", download);
 
+        _processRefreshCounter++;
+        if (_processRefreshCounter >= ProcessRefreshInterval)
+        {
+            _processRefreshCounter = 0;
+            _cachedTopGpuProcess = ReadTopGpuProcess();
+        }
+
         return new HardwareSnapshot
         {
             Timestamp = DateTime.Now,
@@ -287,7 +330,8 @@ public sealed class HardwareMonitorService : IDisposable
             NetUploadBytesPerSecond = upload,
             NetUploadMaxBytesPerSecond = _maxValues["UP"],
             NetDownloadBytesPerSecond = download,
-            NetDownloadMaxBytesPerSecond = _maxValues["DOWN"]
+            NetDownloadMaxBytesPerSecond = _maxValues["DOWN"],
+            TopGpuProcess = _cachedTopGpuProcess
         };
     }
 
@@ -529,6 +573,64 @@ public sealed class HardwareMonitorService : IDisposable
     }
 
     private void ClearReportedError(string key) => _reportedErrors.Remove(key);
+
+    private string? ReadTopGpuProcess()
+    {
+        try
+        {
+            var category = new PerformanceCounterCategory("GPU Process Memory");
+            string[] instances = category.GetInstanceNames();
+            if (instances.Length == 0) return null;
+
+            var processVram = new Dictionary<int, long>();
+
+            foreach (string instance in instances)
+            {
+                try
+                {
+                    if (!instance.StartsWith("pid_", StringComparison.Ordinal)) continue;
+                    int underscoreIndex = instance.IndexOf('_', 4);
+                    string pidPart = underscoreIndex > 4 ? instance[4..underscoreIndex] : instance[4..];
+                    if (!int.TryParse(pidPart, out int pid)) continue;
+
+                    using var counter = new PerformanceCounter("GPU Process Memory", "Dedicated Usage", instance);
+                    long bytes = counter.RawValue;
+                    if (bytes > 0)
+                    {
+                        if (!processVram.ContainsKey(pid) || bytes > processVram[pid])
+                            processVram[pid] = bytes;
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            if (processVram.Count == 0) return null;
+
+            var top = processVram.OrderByDescending(p => p.Value).First();
+            string name = GetProcessName(top.Key);
+            double mb = top.Value / (1024.0 * 1024.0);
+            return $"{name} ({mb:0.0}MB)";
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string GetProcessName(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return process.ProcessName;
+        }
+        catch
+        {
+            return $"pid_{pid}";
+        }
+    }
 
     private static IGpuMonitor? TryCreateGpuMonitor()
     {

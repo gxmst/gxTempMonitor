@@ -11,9 +11,19 @@
         FontFamily="Segoe UI, Microsoft YaHei">
 
     <Window.Resources>
+        <SolidColorBrush x:Key="ThemeLabelBrush" Color="#FFD6DEE8"/>
+        <SolidColorBrush x:Key="ThemeValueBrush" Color="#FFF8FBFF"/>
+        <SolidColorBrush x:Key="ThemeMaxBrush" Color="#FFFFD36B"/>
+        <SolidColorBrush x:Key="ThemeIndicatorBrush" Color="#FFFF7448"/>
+        <SolidColorBrush x:Key="ThemeNetUpBrush" Color="#FFFFB3A7"/>
+        <SolidColorBrush x:Key="ThemeNetDownBrush" Color="#FF9FF3C6"/>
+        <SolidColorBrush x:Key="ThemeBorderBrush" Color="#3AF2F6FF"/>
+        <Color x:Key="ThemeFlashBaseColor">#14171C</Color>
+        <Color x:Key="ThemeFlashAlertColor">#6B1414</Color>
+
         <Style x:Key="LabelStyle" TargetType="TextBlock">
             <Setter Property="FontSize" Value="9"/>
-            <Setter Property="Foreground" Value="#FFD6DEE8"/>
+            <Setter Property="Foreground" Value="{DynamicResource ThemeLabelBrush}"/>
             <Setter Property="Width" Value="35"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
@@ -28,7 +38,7 @@
             <Setter Property="FontFamily" Value="Cascadia Code, Cascadia Mono, Consolas, Courier New"/>
             <Setter Property="FontSize" Value="11.5"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
-            <Setter Property="Foreground" Value="#FFF8FBFF"/>
+            <Setter Property="Foreground" Value="{DynamicResource ThemeValueBrush}"/>
             <Setter Property="Width" Value="60"/>
             <Setter Property="Margin" Value="5,0,0,0"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
@@ -40,7 +50,7 @@
         </Style>
 
         <Style x:Key="MaxStyle" TargetType="TextBlock" BasedOn="{StaticResource ValueStyle}">
-            <Setter Property="Foreground" Value="#FFFFD36B"/>
+            <Setter Property="Foreground" Value="{DynamicResource ThemeMaxBrush}"/>
             <Setter Property="FontSize" Value="10"/>
             <Setter Property="Margin" Value="10,0,0,0"/>
         </Style>
@@ -51,7 +61,7 @@
             <Setter Property="HorizontalAlignment" Value="Left"/>
             <Setter Property="VerticalAlignment" Value="Stretch"/>
             <Setter Property="Opacity" Value="0"/>
-            <Setter Property="Background" Value="#FFFF7448"/>
+            <Setter Property="Background" Value="{DynamicResource ThemeIndicatorBrush}"/>
             <Setter Property="Margin" Value="-4,1,0,1"/>
             <Setter Property="Effect">
                 <Setter.Value>
@@ -73,6 +83,24 @@
                 <MenuItem x:Name="ShowUpMenuItem" Header="显示上传 (UP)" IsCheckable="True" Click="ShowUp_Click"/>
                 <MenuItem x:Name="ShowDownMenuItem" Header="显示下载 (DN)" IsCheckable="True" Click="ShowDown_Click"/>
             </MenuItem>
+            <MenuItem Header="主题">
+                <MenuItem x:Name="DarkThemeMenuItem" Header="深色" IsCheckable="True" Click="DarkTheme_Click"/>
+                <MenuItem x:Name="LightThemeMenuItem" Header="浅色" IsCheckable="True" Click="LightTheme_Click"/>
+            </MenuItem>
+            <MenuItem Header="透明度">
+                <MenuItem x:Name="Opacity50MenuItem" Header="50%" IsCheckable="True" Click="Opacity50_Click"/>
+                <MenuItem x:Name="Opacity65MenuItem" Header="65%" IsCheckable="True" Click="Opacity65_Click"/>
+                <MenuItem x:Name="Opacity80MenuItem" Header="80%" IsCheckable="True" Click="Opacity80_Click"/>
+                <MenuItem x:Name="Opacity95MenuItem" Header="95%" IsCheckable="True" Click="Opacity95_Click"/>
+            </MenuItem>
+            <MenuItem Header="延迟启动">
+                <MenuItem x:Name="DelayOffMenuItem" Header="关闭" IsCheckable="True" Click="DelayOff_Click"/>
+                <MenuItem x:Name="Delay10MenuItem" Header="10 秒" IsCheckable="True" Click="Delay10_Click"/>
+                <MenuItem x:Name="Delay20MenuItem" Header="20 秒" IsCheckable="True" Click="Delay20_Click"/>
+                <MenuItem x:Name="Delay30MenuItem" Header="30 秒" IsCheckable="True" Click="Delay30_Click"/>
+            </MenuItem>
+            <Separator/>
+            <MenuItem Header="导出 CSV" Click="ExportCsv_Click"/>
             <MenuItem Header="恢复默认状态" Click="RestoreDefaultState_Click"/>
             <Separator/>
             <MenuItem Header="重置最大值" Click="ResetMax_Click"/>
@@ -81,7 +109,7 @@
     </Window.ContextMenu>
 
     <Border x:Name="MainBorder"
-            BorderBrush="#3AF2F6FF" BorderThickness="1" CornerRadius="7"
+            BorderBrush="{DynamicResource ThemeBorderBrush}" BorderThickness="1" CornerRadius="7"
             Padding="9,5" HorizontalAlignment="Right" Width="135"
             MouseEnter="MainBorder_MouseEnter" MouseLeave="MainBorder_MouseLeave">
         <Border.Background>
@@ -95,7 +123,7 @@
                         <ColumnDefinition Width="60"/>
                         <ColumnDefinition Width="60"/>
                     </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="2" Text="MAX" Foreground="#F0FFD36B" FontSize="8" FontWeight="Bold" Margin="10,0,0,0"/>
+                    <TextBlock Grid.Column="2" Text="MAX" Foreground="{DynamicResource ThemeMaxBrush}" FontSize="8" FontWeight="Bold" Margin="10,0,0,0"/>
                 </Grid>
 
                 <Grid Margin="0,1" x:Name="CpuRow" Background="Transparent">
@@ -160,7 +188,7 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="UP ↑" Style="{StaticResource LabelStyle}"/>
-                    <TextBlock x:Name="NetUpText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="#FFFFB3A7" FontSize="10"/>
+                    <TextBlock x:Name="NetUpText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="{DynamicResource ThemeNetUpBrush}" FontSize="10"/>
                     <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
                         <TextBlock x:Name="NetUpMaxText" Text="0.0K" Style="{StaticResource MaxStyle}" FontSize="10"/>
                     </Border>
@@ -173,7 +201,7 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="DW ↓" Style="{StaticResource LabelStyle}"/>
-                    <TextBlock x:Name="NetDownText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="#FF9FF3C6" FontSize="10"/>
+                    <TextBlock x:Name="NetDownText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="{DynamicResource ThemeNetDownBrush}" FontSize="10"/>
                     <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
                         <TextBlock x:Name="NetDownMaxText" Text="0.0K" Style="{StaticResource MaxStyle}" FontSize="10"/>
                     </Border>
