@@ -31,15 +31,13 @@ public partial class App : System.Windows.Application
 
         if (delaySeconds > 0)
         {
-            _ = HardwareMonitorService.Instance;
-            MainWindow = new MainWindow();
-            MainWindow.Hide();
-
             _ = Task.Run(async () =>
             {
                 await Task.Delay(delaySeconds * 1000);
                 Dispatcher.Invoke(() =>
                 {
+                    _ = HardwareMonitorService.Instance;
+                    MainWindow = new MainWindow();
                     MainWindow.Show();
                 });
             });

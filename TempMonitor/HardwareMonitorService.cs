@@ -9,8 +9,6 @@ using System.Threading;
 
 namespace TempMonitor;
 
-public record GpuProcessInfo(string ProcessName, long DedicatedBytes, long SharedBytes);
-
 public sealed class HardwareSnapshot
 {
     public DateTime Timestamp { get; init; } = DateTime.Now;

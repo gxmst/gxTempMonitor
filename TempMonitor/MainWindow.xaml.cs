@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -312,13 +312,13 @@ public partial class MainWindow : Window
     {
         var profile = _currentTheme == WidgetTheme.Light ? ThemeProfile.Light : ThemeProfile.Dark;
 
-        Resources["ThemeLabelBrush"] = new SolidColorBrush(profile.LabelColor);
-        Resources["ThemeValueBrush"] = new SolidColorBrush(profile.ValueColor);
-        Resources["ThemeMaxBrush"] = new SolidColorBrush(profile.MaxColor);
-        Resources["ThemeIndicatorBrush"] = new SolidColorBrush(profile.IndicatorColor);
-        Resources["ThemeNetUpBrush"] = new SolidColorBrush(profile.NetUpColor);
-        Resources["ThemeNetDownBrush"] = new SolidColorBrush(profile.NetDownColor);
-        Resources["ThemeBorderBrush"] = new SolidColorBrush(profile.BorderColor);
+        SetFrozenResource("ThemeLabelBrush", profile.LabelColor);
+        SetFrozenResource("ThemeValueBrush", profile.ValueColor);
+        SetFrozenResource("ThemeMaxBrush", profile.MaxColor);
+        SetFrozenResource("ThemeIndicatorBrush", profile.IndicatorColor);
+        SetFrozenResource("ThemeNetUpBrush", profile.NetUpColor);
+        SetFrozenResource("ThemeNetDownBrush", profile.NetDownColor);
+        SetFrozenResource("ThemeBorderBrush", profile.BorderColor);
         Resources["ThemeFlashBaseColor"] = profile.FlashBaseColor;
         Resources["ThemeFlashAlertColor"] = profile.FlashAlertColor;
 
@@ -334,6 +334,13 @@ public partial class MainWindow : Window
             _trayDarkThemeMenuItem.Checked = _currentTheme == WidgetTheme.Dark;
         if (_trayLightThemeMenuItem != null)
             _trayLightThemeMenuItem.Checked = _currentTheme == WidgetTheme.Light;
+    }
+
+    private void SetFrozenResource(string key, System.Windows.Media.Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        Resources[key] = brush;
     }
 
     private void SetWidgetOpacity(double opacity)
@@ -810,6 +817,8 @@ public partial class MainWindow : Window
 
     private void ExitApplication()
     {
+        HardwareMonitorService.Instance.DataUpdated -= OnHardwareDataUpdated;
+
         _notifyIcon?.Dispose();
         _notifyIcon = null;
 
@@ -831,6 +840,8 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        HardwareMonitorService.Instance.DataUpdated -= OnHardwareDataUpdated;
+        _idleTimer?.Stop();
         _notifyIcon?.Dispose();
         base.OnClosed(e);
     }
