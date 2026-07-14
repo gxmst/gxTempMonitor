@@ -1,4 +1,4 @@
-publish*/
+/publish*/
 *.exe
 *.dll
 *.pdb
