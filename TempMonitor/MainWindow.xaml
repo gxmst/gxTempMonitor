@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="TempMonitor" Width="205" SizeToContent="Height"
         WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
-        Topmost="True" ShowInTaskbar="False" ResizeMode="NoResize"
+        Topmost="True" ShowActivated="False" ShowInTaskbar="False" ResizeMode="NoResize"
         Loaded="Window_Loaded"
         MouseLeftButtonDown="Window_MouseLeftButtonDown"
         MouseLeftButtonUp="Window_MouseLeftButtonUp"
@@ -98,6 +98,16 @@
                 <MenuItem x:Name="Delay10MenuItem" Header="10 秒" IsCheckable="True" Click="Delay10_Click"/>
                 <MenuItem x:Name="Delay20MenuItem" Header="20 秒" IsCheckable="True" Click="Delay20_Click"/>
                 <MenuItem x:Name="Delay30MenuItem" Header="30 秒" IsCheckable="True" Click="Delay30_Click"/>
+            </MenuItem>
+            <MenuItem Header="低干扰选项">
+                <MenuItem x:Name="HotkeyMenuItem" Header="全局热键 Ctrl+Shift+M" IsCheckable="True" Click="Hotkey_Click"/>
+                <MenuItem x:Name="ProcessTrackingMenuItem" Header="进程级 GPU 显存" IsCheckable="True" Click="ProcessTracking_Click"/>
+                <MenuItem x:Name="AlertsMenuItem" Header="告警闪烁" IsCheckable="True" Click="Alerts_Click"/>
+                <MenuItem Header="采样频率">
+                    <MenuItem x:Name="Sample1MenuItem" Header="1 秒" IsCheckable="True" Click="Sample1_Click"/>
+                    <MenuItem x:Name="Sample2MenuItem" Header="2 秒" IsCheckable="True" Click="Sample2_Click"/>
+                    <MenuItem x:Name="Sample5MenuItem" Header="5 秒" IsCheckable="True" Click="Sample5_Click"/>
+                </MenuItem>
             </MenuItem>
             <Separator/>
             <MenuItem Header="导出 CSV" Click="ExportCsv_Click"/>

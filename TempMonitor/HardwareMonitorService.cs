@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -13,12 +15,17 @@ public sealed class HardwareSnapshot
 {
     public DateTime Timestamp { get; init; } = DateTime.Now;
     public float CpuUsage { get; init; }
+    public bool HasCpuUsage { get; init; }
     public float CpuUsageMax { get; init; }
     public float GpuUsagePercent { get; init; }
+    public bool HasGpuUsage { get; init; }
     public float? GpuTemperature { get; init; }
     public float? GpuTemperatureMax { get; init; }
     public float? GpuPowerWatts { get; init; }
+    public string? GpuDeviceName { get; init; }
+    public string? GpuProviderName { get; init; }
     public float RamUsedGb { get; init; }
+    public bool HasRamData { get; init; }
     public float RamAvailableGb { get; init; }
     public float RamUsedMaxGb { get; init; }
     public float RamUsagePercent { get; init; }
@@ -27,6 +34,7 @@ public sealed class HardwareSnapshot
     public float? VramUsedMaxGb { get; init; }
     public string? NetworkInterfaceName { get; init; }
     public float NetTotalBytesPerSecond { get; init; }
+    public bool HasNetworkData { get; init; }
     public float NetUploadBytesPerSecond { get; init; }
     public float NetUploadMaxBytesPerSecond { get; init; }
     public float NetDownloadBytesPerSecond { get; init; }
@@ -37,540 +45,659 @@ public sealed class HardwareSnapshot
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
 internal sealed class MemoryStatusEx
 {
-    public uint dwLength;
-    public uint dwMemoryLoad;
-    public ulong ullTotalPhys;
-    public ulong ullAvailPhys;
-    public ulong ullTotalPageFile;
-    public ulong ullAvailPageFile;
-    public ulong ullTotalVirtual;
-    public ulong ullAvailVirtual;
-    public ulong ullAvailExtendedVirtual;
-
-    public MemoryStatusEx()
-    {
-        dwLength = (uint)Marshal.SizeOf(typeof(MemoryStatusEx));
-    }
+    public uint Length = (uint)Marshal.SizeOf<MemoryStatusEx>();
+    public uint MemoryLoad;
+    public ulong TotalPhysical;
+    public ulong AvailablePhysical;
+    public ulong TotalPageFile;
+    public ulong AvailablePageFile;
+    public ulong TotalVirtual;
+    public ulong AvailableVirtual;
+    public ulong AvailableExtendedVirtual;
 }
 
 public sealed class HardwareMonitorService : IDisposable
 {
-    [return: MarshalAs(UnmanagedType.Bool)]
-    [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-    private static extern bool GlobalMemoryStatusEx([In, Out] MemoryStatusEx lpBuffer);
-
-    private static readonly Lazy<HardwareMonitorService> LazyInstance = new(() => new HardwareMonitorService());
-
-    private const int InterfaceRefreshIntervalSeconds = 10;
-    private const int ZeroTrafficRecheckSeconds = 5;
-    private const int MaxLogBytes = 256 * 1024;
-    private const int RetainedLogBytes = 128 * 1024;
-    private const int MaxHistoryEntries = 3600;
-    private const int ProcessRefreshInterval = 5;
-
-    private readonly object _syncRoot = new();
-    private readonly object _logLock = new();
-    private readonly List<HardwareSnapshot> _history = new();
-    private readonly Dictionary<string, PerformanceCounter> _trafficCounters = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, float> _maxValues = new()
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileTime
     {
-        { "CPU_USAGE", 0 },
-        { "GPU_TEMP", 0 },
-        { "RAM", 0 },
-        { "VRAM", 0 },
-        { "UP", 0 },
-        { "DOWN", 0 }
-    };
+        public uint Low;
+        public uint High;
+
+        public readonly ulong ToUInt64() => ((ulong)High << 32) | Low;
+    }
+
+    private readonly record struct NetworkBaseline(long Received, long Sent, long Timestamp);
+
+    private readonly record struct NetworkRate(
+        string Id,
+        string Name,
+        bool HasMeasurement,
+        float Upload,
+        float Download);
+
+    private readonly record struct GpuCandidate(IGpuMonitor Monitor, GpuReading Reading);
+
+    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static extern bool GlobalMemoryStatusEx([In, Out] MemoryStatusEx buffer);
+
+    [return: MarshalAs(UnmanagedType.Bool)]
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static extern bool GetSystemTimes(
+        out FileTime idleTime,
+        out FileTime kernelTime,
+        out FileTime userTime);
+
+    private static readonly Lazy<HardwareMonitorService> LazyInstance =
+        new(() => new HardwareMonitorService(), LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private const int MaxLogBytes = 256 * 1024;
+    private const int MaxHistoryEntries = 3600;
+    private const int NetworkRefreshSeconds = 10;
+    private const int GpuRetrySeconds = 30;
+    private const int ProcessRefreshSeconds = 15;
+
+    private readonly object _maxLock = new();
+    private readonly object _historyLock = new();
+    private readonly object _logLock = new();
+    private readonly Queue<HardwareSnapshot> _history = new(MaxHistoryEntries);
+    private readonly Dictionary<string, NetworkBaseline> _networkBaselines = new(StringComparer.Ordinal);
     private readonly HashSet<string> _reportedErrors = new(StringComparer.Ordinal);
-    private readonly string _logPath;
+    private readonly List<IGpuMonitor> _gpuMonitors = new();
+    private readonly CancellationTokenSource _cancellation = new();
+    private readonly Thread _pollThread;
 
-    private PerformanceCounter? _cpuCounter;
-    private PerformanceCounter? _recvCounter;
-    private PerformanceCounter? _sentCounter;
-    private IGpuMonitor? _gpuMonitor;
-    private WindowsGpuCounterMonitor? _vramFallback;
-    private string? _interfaceName;
-    private int _zeroTrafficSeconds;
-    private int _networkRefreshCounter = InterfaceRefreshIntervalSeconds;
-    private int _processRefreshCounter = ProcessRefreshInterval;
+    private NetworkInterface[] _networkInterfaces = [];
+    private HardwareSnapshot _latestSnapshot = new();
+    private string? _networkInterfaceId;
+    private string? _networkInterfaceName;
     private string? _cachedTopGpuProcess;
-    private bool _disposed;
+    private string? _selectedGpuProvider;
 
-    private CancellationTokenSource? _cts;
-    private Thread? _pollThread;
+    private ulong _lastIdleTime;
+    private ulong _lastKernelTime;
+    private ulong _lastUserTime;
+    private float _lastCpuUsage;
+    private bool _hasCpuBaseline;
+    private long _nextNetworkRefreshTimestamp;
+    private long _nextGpuProbeTimestamp;
+    private long _nextProcessRefreshTimestamp;
+
+    private float _cpuUsageMax;
+    private float _gpuTemperatureMax;
+    private float _ramUsedMax;
+    private float _vramUsedMax;
+    private float _uploadMax;
+    private float _downloadMax;
+
+    private int _samplingIntervalMilliseconds = 1000;
+    private int _trackTopGpuProcess;
+    private int _disposeState;
 
     public static HardwareMonitorService Instance => LazyInstance.Value;
+    public static bool IsValueCreated => LazyInstance.IsValueCreated;
 
     public event Action<HardwareSnapshot>? DataUpdated;
 
-    public HardwareSnapshot LatestSnapshot { get; private set; } = new();
+    public HardwareSnapshot LatestSnapshot => Volatile.Read(ref _latestSnapshot);
 
     private HardwareMonitorService()
     {
-        string exePath = Process.GetCurrentProcess().MainModule?.FileName
-            ?? Environment.ProcessPath
-            ?? AppContext.BaseDirectory;
-        string exeDir = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory;
-        _logPath = Path.Combine(exeDir, "TempMonitor.log");
+        AppPaths.EnsureDataDirectory();
 
-        Initialize();
+        RefreshNetworkInterfaces();
+        TryProbeGpu(force: true);
 
-        _cts = new CancellationTokenSource();
-        _pollThread = new Thread(PollLoop) { IsBackground = true, Name = "HardwareMonitorPoll" };
+        _pollThread = new Thread(PollLoop)
+        {
+            IsBackground = true,
+            Name = "gxTempMonitor.Sampler",
+            Priority = ThreadPriority.BelowNormal
+        };
         _pollThread.Start();
+    }
+
+    public void Configure(int samplingIntervalSeconds, bool trackTopGpuProcess)
+    {
+        SetSamplingInterval(samplingIntervalSeconds);
+        SetProcessTrackingEnabled(trackTopGpuProcess);
+    }
+
+    public void SetSamplingInterval(int seconds)
+    {
+        int normalized = seconds is 1 or 2 or 5 ? seconds : 1;
+        Volatile.Write(ref _samplingIntervalMilliseconds, normalized * 1000);
+    }
+
+    public void SetProcessTrackingEnabled(bool enabled)
+    {
+        Volatile.Write(ref _trackTopGpuProcess, enabled ? 1 : 0);
+        Volatile.Write(ref _cachedTopGpuProcess, null);
+        Interlocked.Exchange(ref _nextProcessRefreshTimestamp, 0);
     }
 
     public void ResetMaxValues()
     {
-        lock (_syncRoot)
+        lock (_maxLock)
         {
-            foreach (string key in _maxValues.Keys)
-            {
-                _maxValues[key] = 0;
-            }
+            _cpuUsageMax = 0;
+            _gpuTemperatureMax = 0;
+            _ramUsedMax = 0;
+            _vramUsedMax = 0;
+            _uploadMax = 0;
+            _downloadMax = 0;
         }
     }
 
     public string ExportCsv()
     {
-        lock (_logLock)
-        {
-            if (_history.Count == 0)
-                return "Timestamp,CPU Usage %,GPU Temp °C,GPU Usage %,RAM Used GB,RAM Usage %,VRAM Used GB,Upload B/s,Download B/s,Top GPU Process";
+        HardwareSnapshot[] snapshots;
+        lock (_historyLock)
+            snapshots = _history.ToArray();
 
-            var sb = new StringBuilder();
-            sb.AppendLine("Timestamp,CPU Usage %,GPU Temp °C,GPU Usage %,RAM Used GB,RAM Usage %,VRAM Used GB,Upload B/s,Download B/s,Top GPU Process");
-            foreach (var s in _history)
-            {
-                var gpuTemp = s.GpuTemperature.HasValue ? $"{s.GpuTemperature.Value:0.0}" : "";
-                var vram = s.VramUsedGb.HasValue ? $"{s.VramUsedGb.Value:F1}" : "";
-                var topProc = s.TopGpuProcess ?? "";
-                sb.AppendLine($"{s.Timestamp:yyyy-MM-dd HH:mm:ss},{s.CpuUsage:0.0},{gpuTemp},{s.GpuUsagePercent:0.0},{s.RamUsedGb:F1},{s.RamUsagePercent:0.0},{vram},{s.NetUploadBytesPerSecond:0},{s.NetDownloadBytesPerSecond:0},{topProc}");
-            }
-            return sb.ToString();
+        var builder = new StringBuilder(Math.Max(256, snapshots.Length * 160));
+        builder.AppendLine("Timestamp,CPU Usage %,GPU Temp °C,GPU Usage %,GPU Device,GPU Provider,RAM Used GB,RAM Usage %,VRAM Used GB,Upload B/s,Download B/s,Top GPU Process");
+
+        foreach (HardwareSnapshot snapshot in snapshots)
+        {
+            string[] values =
+            [
+                snapshot.Timestamp.ToString("O", CultureInfo.InvariantCulture),
+                snapshot.HasCpuUsage ? FormatNumber(snapshot.CpuUsage) : string.Empty,
+                FormatOptionalNumber(snapshot.GpuTemperature),
+                snapshot.HasGpuUsage ? FormatNumber(snapshot.GpuUsagePercent) : string.Empty,
+                EscapeSpreadsheetFormula(snapshot.GpuDeviceName ?? string.Empty),
+                EscapeSpreadsheetFormula(snapshot.GpuProviderName ?? string.Empty),
+                snapshot.HasRamData ? FormatNumber(snapshot.RamUsedGb) : string.Empty,
+                snapshot.HasRamData ? FormatNumber(snapshot.RamUsagePercent) : string.Empty,
+                FormatOptionalNumber(snapshot.VramUsedGb),
+                snapshot.HasNetworkData ? FormatNumber(snapshot.NetUploadBytesPerSecond, "0") : string.Empty,
+                snapshot.HasNetworkData ? FormatNumber(snapshot.NetDownloadBytesPerSecond, "0") : string.Empty,
+                EscapeSpreadsheetFormula(snapshot.TopGpuProcess ?? string.Empty)
+            ];
+
+            builder.AppendLine(string.Join(',', values.Select(EscapeCsv)));
         }
+
+        return builder.ToString();
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0) return;
 
         DataUpdated = null;
+        _cancellation.Cancel();
+        bool samplerStopped = _pollThread.Join(TimeSpan.FromSeconds(3));
 
-        _cts?.Cancel();
-
-        if (_pollThread != null && !_pollThread.Join(3000))
+        if (!samplerStopped)
         {
-            try { _pollThread.Interrupt(); } catch { }
+            ReportError("shutdown-sampler-timeout", new TimeoutException("The sampler thread did not stop within three seconds."));
+            return;
         }
 
-        _cts?.Dispose();
-        _cts = null;
-        _pollThread = null;
-
-        lock (_syncRoot)
-        {
-            _cpuCounter?.Dispose();
-            _recvCounter?.Dispose();
-            _sentCounter?.Dispose();
-            _gpuMonitor?.Dispose();
-            _gpuMonitor = null;
-            _vramFallback?.Dispose();
-            _vramFallback = null;
-
-            foreach (PerformanceCounter counter in _trafficCounters.Values)
-            {
-                counter.Dispose();
-            }
-
-            _trafficCounters.Clear();
-        }
     }
 
     private void PollLoop()
     {
-        while (!_disposed)
+        try
         {
-            try
+            WaitHandle cancellationHandle = _cancellation.Token.WaitHandle;
+            while (!_cancellation.IsCancellationRequested)
             {
-                if (!_cts!.Token.WaitHandle.WaitOne(TimeSpan.FromSeconds(1)))
+                int interval = Volatile.Read(ref _samplingIntervalMilliseconds);
+                if (cancellationHandle.WaitOne(interval)) break;
+
+                try
                 {
                     PollMetrics();
+                    ClearReportedError("poll-loop");
                 }
-                else
+                catch (Exception ex)
                 {
-                    break;
+                    ReportError("poll-loop", ex);
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (ThreadInterruptedException)
-            {
-                break;
             }
         }
-    }
-
-    private void Initialize()
-    {
-        lock (_syncRoot)
+        finally
         {
-            try
+            if (Volatile.Read(ref _disposeState) != 0)
             {
-                _gpuMonitor = TryCreateGpuMonitor();
-                _gpuMonitor?.TryInitialize();
-
-                if (_gpuMonitor is not WindowsGpuCounterMonitor)
-                {
-                    var fallback = new WindowsGpuCounterMonitor();
-                    if (fallback.TryInitialize())
-                        _vramFallback = fallback;
-                    else
-                        fallback.Dispose();
-                }
-
-                _cpuCounter = new PerformanceCounter("Processor", "% Processor Time", "_Total");
-                _cpuCounter.NextValue();
-
-                RefreshNetworkInterfaces();
-                SelectBestNetworkInterface();
-                ClearReportedError("init");
+                foreach (IGpuMonitor monitor in _gpuMonitors)
+                    monitor.Dispose();
+                _gpuMonitors.Clear();
             }
-            catch (Exception ex)
-            {
-                ReportError("init", ex);
-            }
+
+            _cancellation.Dispose();
         }
     }
 
     private void PollMetrics()
     {
-        if (_disposed) return;
+        if (Volatile.Read(ref _disposeState) != 0) return;
 
-        HardwareSnapshot snapshot;
-        lock (_syncRoot)
+        HardwareSnapshot snapshot = BuildSnapshot();
+
+        Volatile.Write(ref _latestSnapshot, snapshot);
+
+        lock (_historyLock)
         {
-            snapshot = BuildSnapshot();
-            LatestSnapshot = snapshot;
+            while (_history.Count >= MaxHistoryEntries)
+                _history.Dequeue();
+            _history.Enqueue(snapshot);
         }
 
-        lock (_logLock)
-        {
-            _history.Add(snapshot);
-            while (_history.Count > MaxHistoryEntries)
-                _history.RemoveAt(0);
-        }
-
-        DataUpdated?.Invoke(snapshot);
+        NotifySubscribers(snapshot);
     }
 
     private HardwareSnapshot BuildSnapshot()
     {
-        float cpuUsage = ReadCpuUsage();
-        (float ramUsedGb, float ramUsagePercent, float totalRamGb) = ReadRamUsage();
-        (float upload, float download) = ReadNetworkMetrics();
+        (bool hasCpuUsage, float cpuUsage) = ReadCpuUsage();
+        (bool hasRamData, float ramUsedGb, float ramAvailableGb, float ramUsagePercent, float totalRamGb) = ReadRamUsage();
+        (bool hasNetworkData, float upload, float download) = ReadNetworkMetrics();
 
-        float gpuUsagePercent = 0;
-        float? gpuTemp = null;
-        float? gpuPowerWatts = null;
-        float? vramGb = null;
+        TryProbeGpu(force: false);
+        (GpuReading gpu, string? gpuProviderName) = ReadGpuMetrics();
 
-        if (_gpuMonitor?.Initialized == true)
+        bool hasGpuUsage = gpu.Usage.HasValue;
+        float gpuUsage = Math.Clamp(gpu.Usage ?? 0, 0, 100);
+        float cpuUsageMax;
+        float gpuTemperatureMax;
+        float ramUsedMax;
+        float vramUsedMax;
+        float uploadMax;
+        float downloadMax;
+        lock (_maxLock)
         {
-            var gpu = _gpuMonitor.Read();
-            gpuTemp = gpu.Temperature;
-            gpuUsagePercent = gpu.Usage ?? 0;
-            vramGb = gpu.VramUsedGb;
-            gpuPowerWatts = gpu.PowerWatts;
+            if (hasCpuUsage)
+                UpdateMax(ref _cpuUsageMax, cpuUsage);
+            UpdateMax(ref _gpuTemperatureMax, gpu.Temperature);
+            if (hasRamData)
+                UpdateMax(ref _ramUsedMax, ramUsedGb);
+            UpdateMax(ref _vramUsedMax, gpu.VramUsedGb);
+            if (hasNetworkData)
+            {
+                UpdateMax(ref _uploadMax, upload);
+                UpdateMax(ref _downloadMax, download);
+            }
+
+            cpuUsageMax = _cpuUsageMax;
+            gpuTemperatureMax = _gpuTemperatureMax;
+            ramUsedMax = _ramUsedMax;
+            vramUsedMax = _vramUsedMax;
+            uploadMax = _uploadMax;
+            downloadMax = _downloadMax;
         }
 
-        if (vramGb == null && _vramFallback?.Initialized == true)
-        {
-            var fallback = _vramFallback.Read();
-            vramGb = fallback.VramUsedGb;
-        }
-
-        UpdateMax("CPU_USAGE", cpuUsage);
-        UpdateMaxIfHasValue("GPU_TEMP", gpuTemp);
-        UpdateMax("RAM", ramUsedGb);
-        UpdateMaxIfHasValue("VRAM", vramGb);
-        UpdateMax("UP", upload);
-        UpdateMax("DOWN", download);
-
-        _processRefreshCounter++;
-        if (_processRefreshCounter >= ProcessRefreshInterval)
-        {
-            _processRefreshCounter = 0;
-            _cachedTopGpuProcess = ReadTopGpuProcess();
-        }
+        UpdateTopGpuProcessIfNeeded();
 
         return new HardwareSnapshot
         {
             Timestamp = DateTime.Now,
             CpuUsage = cpuUsage,
-            CpuUsageMax = _maxValues["CPU_USAGE"],
-            GpuUsagePercent = gpuUsagePercent,
-            GpuTemperature = gpuTemp,
-            GpuTemperatureMax = _maxValues["GPU_TEMP"] > 0 ? _maxValues["GPU_TEMP"] : null,
-            GpuPowerWatts = gpuPowerWatts,
+            HasCpuUsage = hasCpuUsage,
+            CpuUsageMax = cpuUsageMax,
+            GpuUsagePercent = gpuUsage,
+            HasGpuUsage = hasGpuUsage,
+            GpuTemperature = gpu.Temperature,
+            GpuTemperatureMax = gpuTemperatureMax > 0 ? gpuTemperatureMax : null,
+            GpuPowerWatts = gpu.PowerWatts,
+            GpuDeviceName = gpu.DeviceName,
+            GpuProviderName = gpuProviderName,
             RamUsedGb = ramUsedGb,
-            RamAvailableGb = Math.Max(0, totalRamGb - ramUsedGb),
-            RamUsedMaxGb = _maxValues["RAM"],
+            HasRamData = hasRamData,
+            RamAvailableGb = ramAvailableGb,
+            RamUsedMaxGb = ramUsedMax,
             RamUsagePercent = ramUsagePercent,
             TotalRamGb = totalRamGb,
-            VramUsedGb = vramGb,
-            VramUsedMaxGb = _maxValues["VRAM"] > 0 ? _maxValues["VRAM"] : null,
-            NetworkInterfaceName = _interfaceName,
+            VramUsedGb = gpu.VramUsedGb,
+            VramUsedMaxGb = vramUsedMax > 0 ? vramUsedMax : null,
+            NetworkInterfaceName = _networkInterfaceName,
             NetTotalBytesPerSecond = upload + download,
+            HasNetworkData = hasNetworkData,
             NetUploadBytesPerSecond = upload,
-            NetUploadMaxBytesPerSecond = _maxValues["UP"],
+            NetUploadMaxBytesPerSecond = uploadMax,
             NetDownloadBytesPerSecond = download,
-            NetDownloadMaxBytesPerSecond = _maxValues["DOWN"],
-            TopGpuProcess = _cachedTopGpuProcess
+            NetDownloadMaxBytesPerSecond = downloadMax,
+            TopGpuProcess = Volatile.Read(ref _trackTopGpuProcess) != 0 ? _cachedTopGpuProcess : null
         };
     }
 
-    private float ReadCpuUsage()
+    private (bool Available, float Usage) ReadCpuUsage()
     {
-        if (_cpuCounter == null) return 0;
-
         try
         {
-            float cpuUsage = _cpuCounter.NextValue();
-            ClearReportedError("metric-cpu-usage");
-            return cpuUsage;
+            if (!GetSystemTimes(out FileTime idle, out FileTime kernel, out FileTime user))
+                throw new InvalidOperationException($"GetSystemTimes failed with Win32 error {Marshal.GetLastPInvokeError()}.");
+
+            ulong idleValue = idle.ToUInt64();
+            ulong kernelValue = kernel.ToUInt64();
+            ulong userValue = user.ToUInt64();
+
+            bool hasMeasurement = _hasCpuBaseline;
+            if (_hasCpuBaseline &&
+                idleValue >= _lastIdleTime &&
+                kernelValue >= _lastKernelTime &&
+                userValue >= _lastUserTime)
+            {
+                ulong idleDelta = idleValue - _lastIdleTime;
+                ulong kernelDelta = kernelValue - _lastKernelTime;
+                ulong userDelta = userValue - _lastUserTime;
+                ulong totalDelta = kernelDelta + userDelta;
+
+                if (totalDelta > 0 && idleDelta <= totalDelta)
+                    _lastCpuUsage = Math.Clamp((float)((totalDelta - idleDelta) * 100d / totalDelta), 0, 100);
+            }
+            else if (_hasCpuBaseline)
+            {
+                hasMeasurement = false;
+            }
+
+            _lastIdleTime = idleValue;
+            _lastKernelTime = kernelValue;
+            _lastUserTime = userValue;
+            _hasCpuBaseline = true;
+            ClearReportedError("metric-cpu");
+            return (hasMeasurement, _lastCpuUsage);
         }
         catch (Exception ex)
         {
-            ReportError("metric-cpu-usage", ex);
-            return 0;
+            ReportError("metric-cpu", ex);
+            _hasCpuBaseline = false;
+            return (false, _lastCpuUsage);
         }
     }
 
-    private (float UsedGb, float UsagePercent, float TotalGb) ReadRamUsage()
+    private (bool Available, float UsedGb, float AvailableGb, float UsagePercent, float TotalGb) ReadRamUsage()
     {
         try
         {
-            var memoryStatus = new MemoryStatusEx();
-            if (!GlobalMemoryStatusEx(memoryStatus)) return (0, 0, 0);
+            var status = new MemoryStatusEx();
+            if (!GlobalMemoryStatusEx(status))
+                throw new InvalidOperationException($"GlobalMemoryStatusEx failed with Win32 error {Marshal.GetLastPInvokeError()}.");
 
-            double total = memoryStatus.ullTotalPhys / (1024.0 * 1024.0 * 1024.0);
-            double used = (memoryStatus.ullTotalPhys - memoryStatus.ullAvailPhys) / (1024.0 * 1024.0 * 1024.0);
+            const double bytesPerGb = 1024d * 1024d * 1024d;
+            double total = status.TotalPhysical / bytesPerGb;
+            double available = status.AvailablePhysical / bytesPerGb;
+            double used = Math.Max(0, total - available);
             ClearReportedError("metric-ram");
-            return ((float)used, memoryStatus.dwMemoryLoad, (float)total);
+            return (true, (float)used, (float)available, status.MemoryLoad, (float)total);
         }
         catch (Exception ex)
         {
             ReportError("metric-ram", ex);
-            return (0, 0, 0);
+            return (false, 0, 0, 0, 0);
         }
     }
 
-    private (float Upload, float Download) ReadNetworkMetrics()
+    private (bool Available, float Upload, float Download) ReadNetworkMetrics()
     {
-        _networkRefreshCounter++;
-        if (_networkRefreshCounter >= InterfaceRefreshIntervalSeconds)
-        {
-            _networkRefreshCounter = 0;
+        long now = Stopwatch.GetTimestamp();
+        if (now >= _nextNetworkRefreshTimestamp)
             RefreshNetworkInterfaces();
-            SelectBestNetworkInterface();
-        }
 
-        if (_recvCounter == null || _sentCounter == null) return (0, 0);
+        var rates = new List<NetworkRate>(_networkInterfaces.Length);
+        var activeIds = new HashSet<string>(StringComparer.Ordinal);
 
-        try
+        foreach (NetworkInterface networkInterface in _networkInterfaces)
         {
-            float upload = _sentCounter.NextValue();
-            float download = _recvCounter.NextValue();
+            string id = string.IsNullOrWhiteSpace(networkInterface.Id)
+                ? $"{networkInterface.NetworkInterfaceType}:{networkInterface.Name}"
+                : networkInterface.Id;
+            activeIds.Add(id);
 
-            if (upload <= 0 && download <= 0)
+            try
             {
-                _zeroTrafficSeconds++;
-            }
-            else
-            {
-                _zeroTrafficSeconds = 0;
-            }
+                IPv4InterfaceStatistics statistics = networkInterface.GetIPv4Statistics();
+                var current = new NetworkBaseline(statistics.BytesReceived, statistics.BytesSent, now);
 
-            if (_zeroTrafficSeconds >= ZeroTrafficRecheckSeconds)
-            {
-                _zeroTrafficSeconds = 0;
-                SelectBestNetworkInterface();
-            }
+                float upload = 0;
+                float download = 0;
+                bool hasMeasurement = false;
+                if (_networkBaselines.TryGetValue(id, out NetworkBaseline previous))
+                {
+                    double elapsedSeconds = (now - previous.Timestamp) / (double)Stopwatch.Frequency;
+                    long receivedDelta = current.Received - previous.Received;
+                    long sentDelta = current.Sent - previous.Sent;
+                    if (elapsedSeconds is >= 0.1 and <= 15 && receivedDelta >= 0 && sentDelta >= 0)
+                    {
+                        download = (float)(receivedDelta / elapsedSeconds);
+                        upload = (float)(sentDelta / elapsedSeconds);
+                        hasMeasurement = true;
+                    }
+                }
 
-            ClearReportedError("metric-network");
-            return (upload, download);
+                _networkBaselines[id] = current;
+                rates.Add(new NetworkRate(id, networkInterface.Name, hasMeasurement, upload, download));
+                ClearReportedError($"network-interface:{id}");
+            }
+            catch (Exception ex) when (ex is NetworkInformationException or
+                                       InvalidOperationException or
+                                       PlatformNotSupportedException)
+            {
+                _networkBaselines.Remove(id);
+                ReportError($"network-interface:{id}", ex);
+            }
         }
-        catch (Exception ex)
+
+        foreach (string staleId in _networkBaselines.Keys.Where(id => !activeIds.Contains(id)).ToArray())
+            _networkBaselines.Remove(staleId);
+
+        if (rates.Count == 0)
         {
-            ReportError("metric-network", ex);
-            RefreshNetworkInterfaces();
-            SelectBestNetworkInterface();
-            return (0, 0);
+            _networkInterfaceId = null;
+            _networkInterfaceName = null;
+            return (false, 0, 0);
         }
+
+        NetworkRate selected = rates
+            .OrderByDescending(rate => rate.Upload + rate.Download)
+            .First();
+
+        if (selected.Upload + selected.Download <= 0 && _networkInterfaceId != null)
+        {
+            NetworkRate? previousSelection = rates
+                .Cast<NetworkRate?>()
+                .FirstOrDefault(rate => string.Equals(rate?.Id, _networkInterfaceId, StringComparison.Ordinal));
+            if (previousSelection.HasValue)
+                selected = previousSelection.Value;
+        }
+
+        _networkInterfaceId = selected.Id;
+        _networkInterfaceName = selected.Name;
+        ClearReportedError("metric-network");
+        return (selected.HasMeasurement, selected.Upload, selected.Download);
     }
 
     private void RefreshNetworkInterfaces()
     {
         try
         {
-            var category = new PerformanceCounterCategory("Network Interface");
-            string[] instanceNames = category.GetInstanceNames();
-
-            foreach (string instance in instanceNames)
-            {
-                if (ShouldIgnoreInterface(instance) || _trafficCounters.ContainsKey(instance))
-                    continue;
-
-                var counter = new PerformanceCounter("Network Interface", "Bytes Total/sec", instance);
-                counter.NextValue();
-                _trafficCounters[instance] = counter;
-            }
-
-            var staleInstances = _trafficCounters.Keys
-                .Where(instance => !instanceNames.Contains(instance, StringComparer.Ordinal))
-                .ToList();
-
-            foreach (string instance in staleInstances)
-            {
-                _trafficCounters[instance].Dispose();
-                _trafficCounters.Remove(instance);
-
-                if (string.Equals(_interfaceName, instance, StringComparison.Ordinal))
-                {
-                    SetActiveNetworkInterface(null);
-                }
-            }
-
+            _networkInterfaces = NetworkInterface.GetAllNetworkInterfaces()
+                .Where(IsUsableNetworkInterface)
+                .ToArray();
+            _nextNetworkRefreshTimestamp = Stopwatch.GetTimestamp() + SecondsToStopwatchTicks(NetworkRefreshSeconds);
             ClearReportedError("network-refresh");
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is NetworkInformationException or PlatformNotSupportedException)
         {
+            _networkInterfaces = [];
+            _nextNetworkRefreshTimestamp = Stopwatch.GetTimestamp() + SecondsToStopwatchTicks(NetworkRefreshSeconds);
             ReportError("network-refresh", ex);
         }
     }
 
-    private void SelectBestNetworkInterface()
-    {
-        if (_trafficCounters.Count == 0) return;
+    private static bool IsUsableNetworkInterface(NetworkInterface networkInterface) =>
+        networkInterface.OperationalStatus == OperationalStatus.Up &&
+        networkInterface.NetworkInterfaceType is not NetworkInterfaceType.Loopback and not NetworkInterfaceType.Tunnel &&
+        !networkInterface.Name.Contains("Loopback", StringComparison.OrdinalIgnoreCase);
 
+    private void TryProbeGpu(bool force)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (!force && now < _nextGpuProbeTimestamp) return;
+
+        if (NvidiaGpuMonitor.IsNvmlAvailable)
+            TryAddGpuMonitor(() => new NvidiaGpuMonitor());
+        if (AmdGpuMonitor.IsAdlAvailable)
+            TryAddGpuMonitor(() => new AmdGpuMonitor());
+        TryAddGpuMonitor(() => new WindowsGpuCounterMonitor());
+        _nextGpuProbeTimestamp = now + SecondsToStopwatchTicks(GpuRetrySeconds);
+    }
+
+    private void TryAddGpuMonitor<TMonitor>(Func<TMonitor> factory)
+        where TMonitor : class, IGpuMonitor
+    {
+        if (_gpuMonitors.Any(monitor => monitor is TMonitor)) return;
+
+        TMonitor? monitor = null;
         try
         {
-            string? bestInstance = null;
-            float highestTraffic = -1;
-
-            foreach ((string instance, PerformanceCounter counter) in _trafficCounters)
+            monitor = factory();
+            if (monitor.TryInitialize())
             {
-                float value;
-                try
-                {
-                    value = counter.NextValue();
-                    ClearReportedError($"network-counter:{instance}");
-                }
-                catch (Exception ex)
-                {
-                    ReportError($"network-counter:{instance}", ex);
-                    continue;
-                }
-
-                if (value > highestTraffic)
-                {
-                    highestTraffic = value;
-                    bestInstance = instance;
-                }
+                _gpuMonitors.Add(monitor);
+                ClearReportedError($"gpu-probe:{typeof(TMonitor).Name}");
+                monitor = null;
             }
-
-            if (bestInstance != null && !string.Equals(bestInstance, _interfaceName, StringComparison.Ordinal))
-            {
-                SetActiveNetworkInterface(bestInstance);
-            }
-
-            ClearReportedError("network-select");
         }
         catch (Exception ex)
         {
-            ReportError("network-select", ex);
+            ReportError($"gpu-probe:{typeof(TMonitor).Name}", ex);
+        }
+        finally
+        {
+            monitor?.Dispose();
         }
     }
 
-    private void SetActiveNetworkInterface(string? interfaceName)
+    private (GpuReading Reading, string? ProviderName) ReadGpuMetrics()
     {
-        _recvCounter?.Dispose();
-        _sentCounter?.Dispose();
-        _recvCounter = null;
-        _sentCounter = null;
-        _interfaceName = interfaceName;
-
-        if (string.IsNullOrWhiteSpace(interfaceName)) return;
-
-        _recvCounter = new PerformanceCounter("Network Interface", "Bytes Received/sec", interfaceName);
-        _sentCounter = new PerformanceCounter("Network Interface", "Bytes Sent/sec", interfaceName);
-        _recvCounter.NextValue();
-        _sentCounter.NextValue();
-    }
-
-    private static bool ShouldIgnoreInterface(string instanceName) =>
-        instanceName.Contains("Loopback", StringComparison.OrdinalIgnoreCase) ||
-        instanceName.Contains("Pseudo", StringComparison.OrdinalIgnoreCase) ||
-        instanceName.Contains("Teredo", StringComparison.OrdinalIgnoreCase);
-
-    private void UpdateMax(string key, float current)
-    {
-        if (current > _maxValues[key])
-            _maxValues[key] = current;
-    }
-
-    private void UpdateMaxIfHasValue(string key, float? current)
-    {
-        if (current.HasValue)
-            UpdateMax(key, current.Value);
-    }
-
-    private void ReportError(string key, Exception ex)
-    {
-        if (!_reportedErrors.Add(key)) return;
-
-        try
+        var candidates = new List<GpuCandidate>(_gpuMonitors.Count);
+        for (int index = _gpuMonitors.Count - 1; index >= 0; index--)
         {
-            lock (_logLock)
+            IGpuMonitor monitor = _gpuMonitors[index];
+            if (!monitor.Initialized)
             {
-                TrimLogIfNeeded();
-                File.AppendAllText(_logPath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {key}: {ex}{Environment.NewLine}");
+                monitor.Dispose();
+                _gpuMonitors.RemoveAt(index);
+                continue;
+            }
+
+            GpuReading reading = monitor.Read();
+            if (!monitor.Initialized)
+            {
+                monitor.Dispose();
+                _gpuMonitors.RemoveAt(index);
+                continue;
+            }
+
+            if (HasAnyGpuMetric(reading))
+                candidates.Add(new GpuCandidate(monitor, reading));
+        }
+
+        if (candidates.Count == 0)
+        {
+            _selectedGpuProvider = null;
+            return (GpuReading.Empty, null);
+        }
+
+        GpuCandidate best = candidates[0];
+        for (int index = 1; index < candidates.Count; index++)
+        {
+            if (IsBetterGpuCandidate(candidates[index], best))
+                best = candidates[index];
+        }
+
+        GpuCandidate? current = candidates
+            .Cast<GpuCandidate?>()
+            .FirstOrDefault(candidate => string.Equals(
+                candidate?.Monitor.VendorName,
+                _selectedGpuProvider,
+                StringComparison.Ordinal));
+
+        GpuCandidate selected = best;
+        if (current.HasValue && !ReferenceEquals(current.Value.Monitor, best.Monitor))
+        {
+            float? currentUsage = current.Value.Reading.Usage;
+            float? bestUsage = best.Reading.Usage;
+            bool currentIsWindows = current.Value.Monitor is WindowsGpuCounterMonitor;
+            bool bestIsWindows = best.Monitor is WindowsGpuCounterMonitor;
+
+            bool keepCurrent;
+            if (currentIsWindows && !bestIsWindows)
+            {
+                keepCurrent = currentUsage.HasValue && bestUsage.HasValue &&
+                              currentUsage.Value > bestUsage.Value + 10f;
+            }
+            else
+            {
+                float switchThreshold = bestIsWindows && !currentIsWindows ? 10f : 5f;
+                keepCurrent = (currentUsage.HasValue && !bestUsage.HasValue) ||
+                              (currentUsage.HasValue && bestUsage.HasValue &&
+                               bestUsage.Value <= currentUsage.Value + switchThreshold) ||
+                              (!currentUsage.HasValue && !bestUsage.HasValue);
+            }
+
+            if (keepCurrent)
+            {
+                selected = current.Value;
             }
         }
-        catch
-        {
-        }
+
+        _selectedGpuProvider = selected.Monitor.VendorName;
+        return (selected.Reading, selected.Monitor.VendorName);
     }
 
-    private void TrimLogIfNeeded()
+    private static bool HasAnyGpuMetric(GpuReading reading) =>
+        reading.Temperature.HasValue || reading.Usage.HasValue || reading.VramUsedGb.HasValue ||
+        reading.VramTotalGb.HasValue || reading.PowerWatts.HasValue;
+
+    private static bool IsBetterGpuCandidate(GpuCandidate candidate, GpuCandidate current)
     {
-        if (!File.Exists(_logPath)) return;
+        float candidateUsage = candidate.Reading.Usage ?? -1;
+        float currentUsage = current.Reading.Usage ?? -1;
+        bool candidateNative = candidate.Monitor is not WindowsGpuCounterMonitor;
+        bool currentNative = current.Monitor is not WindowsGpuCounterMonitor;
+        if (candidateNative != currentNative)
+        {
+            float nativeUsage = candidateNative ? candidateUsage : currentUsage;
+            float windowsUsage = candidateNative ? currentUsage : candidateUsage;
+            return windowsUsage > nativeUsage + 10f ? !candidateNative : candidateNative;
+        }
 
-        var fileInfo = new FileInfo(_logPath);
-        if (fileInfo.Length <= MaxLogBytes) return;
+        if (Math.Abs(candidateUsage - currentUsage) > 0.01f)
+            return candidateUsage > currentUsage;
 
-        using var source = new FileStream(_logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        long bytesToKeep = Math.Min(RetainedLogBytes, source.Length);
-        source.Seek(-bytesToKeep, SeekOrigin.End);
-
-        byte[] buffer = new byte[bytesToKeep];
-        int bytesRead = source.Read(buffer, 0, buffer.Length);
-        if (bytesRead <= 0) return;
-
-        int startIndex = Array.IndexOf(buffer, (byte)'\n');
-        if (startIndex < 0 || startIndex >= bytesRead - 1)
-            startIndex = 0;
-        else
-            startIndex++;
-
-        File.WriteAllBytes(_logPath, buffer[startIndex..bytesRead]);
+        int candidateMetrics = CountGpuMetrics(candidate.Reading);
+        int currentMetrics = CountGpuMetrics(current.Reading);
+        return candidateMetrics > currentMetrics;
     }
 
-    private void ClearReportedError(string key) => _reportedErrors.Remove(key);
+    private static int CountGpuMetrics(GpuReading reading) =>
+        (reading.Temperature.HasValue ? 1 : 0) +
+        (reading.Usage.HasValue ? 1 : 0) +
+        (reading.VramUsedGb.HasValue ? 1 : 0) +
+        (reading.VramTotalGb.HasValue ? 1 : 0) +
+        (reading.PowerWatts.HasValue ? 1 : 0);
+
+    private void UpdateTopGpuProcessIfNeeded()
+    {
+        if (Volatile.Read(ref _trackTopGpuProcess) == 0)
+        {
+            _cachedTopGpuProcess = null;
+            return;
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        if (now < _nextProcessRefreshTimestamp) return;
+
+        _nextProcessRefreshTimestamp = now + SecondsToStopwatchTicks(ProcessRefreshSeconds);
+        _cachedTopGpuProcess = ReadTopGpuProcess();
+    }
 
     private string? ReadTopGpuProcess()
     {
@@ -578,81 +705,165 @@ public sealed class HardwareMonitorService : IDisposable
         {
             var category = new PerformanceCounterCategory("GPU Process Memory");
             string[] instances = category.GetInstanceNames();
-            if (instances.Length == 0) return null;
-
             var processVram = new Dictionary<int, long>();
 
             foreach (string instance in instances)
             {
                 try
                 {
-                    if (!instance.StartsWith("pid_", StringComparison.Ordinal)) continue;
-                    int underscoreIndex = instance.IndexOf('_', 4);
-                    string pidPart = underscoreIndex > 4 ? instance[4..underscoreIndex] : instance[4..];
-                    if (!int.TryParse(pidPart, out int pid)) continue;
+                    if (!TryParseProcessId(instance, out int processId)) continue;
 
-                    using var counter = new PerformanceCounter("GPU Process Memory", "Dedicated Usage", instance);
-                    long bytes = counter.RawValue;
-                    if (bytes > 0)
-                    {
-                        if (!processVram.ContainsKey(pid) || bytes > processVram[pid])
-                            processVram[pid] = bytes;
-                    }
+                    using var counter = new PerformanceCounter("GPU Process Memory", "Dedicated Usage", instance, readOnly: true);
+                    long bytes = Math.Max(0, counter.RawValue);
+                    if (bytes == 0) continue;
+
+                    processVram.TryGetValue(processId, out long accumulated);
+                    processVram[processId] = accumulated > long.MaxValue - bytes
+                        ? long.MaxValue
+                        : accumulated + bytes;
                 }
-                catch
+                catch (InvalidOperationException)
                 {
                 }
             }
 
             if (processVram.Count == 0) return null;
 
-            var top = processVram.OrderByDescending(p => p.Value).First();
+            KeyValuePair<int, long> top = processVram.MaxBy(pair => pair.Value);
             string name = GetProcessName(top.Key);
-            double mb = top.Value / (1024.0 * 1024.0);
-            return $"{name} ({mb:0.0}MB)";
+            double megabytes = top.Value / (1024d * 1024d);
+            ClearReportedError("metric-gpu-process");
+            return $"{name} ({megabytes:0.0}MB)";
         }
-        catch
+        catch (Exception ex)
         {
+            ReportError("metric-gpu-process", ex);
             return null;
         }
     }
 
-    private static string GetProcessName(int pid)
+    internal static bool TryParseProcessId(string instanceName, out int processId)
+    {
+        processId = 0;
+        if (!instanceName.StartsWith("pid_", StringComparison.OrdinalIgnoreCase)) return false;
+
+        int separator = instanceName.IndexOf('_', 4);
+        ReadOnlySpan<char> value = separator > 4
+            ? instanceName.AsSpan(4, separator - 4)
+            : instanceName.AsSpan(4);
+        return int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out processId) && processId > 0;
+    }
+
+    private static string GetProcessName(int processId)
     {
         try
         {
-            using var process = Process.GetProcessById(pid);
+            using Process process = Process.GetProcessById(processId);
             return process.ProcessName;
         }
-        catch
+        catch (ArgumentException)
         {
-            return $"pid_{pid}";
+            return $"pid_{processId}";
+        }
+        catch (InvalidOperationException)
+        {
+            return $"pid_{processId}";
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return $"pid_{processId}";
         }
     }
 
-    private static IGpuMonitor? TryCreateGpuMonitor()
+    private void NotifySubscribers(HardwareSnapshot snapshot)
     {
-        if (NvidiaGpuMonitor.IsNvmlAvailable)
+        Action<HardwareSnapshot>? handlers = DataUpdated;
+        if (handlers == null) return;
+
+        foreach (Action<HardwareSnapshot> handler in handlers.GetInvocationList().Cast<Action<HardwareSnapshot>>())
         {
-            var nvidia = new NvidiaGpuMonitor();
-            if (nvidia.TryInitialize())
-                return nvidia;
-            nvidia.Dispose();
+            try
+            {
+                handler(snapshot);
+            }
+            catch (Exception ex)
+            {
+                string subscriber = handler.Method.DeclaringType?.FullName ?? "unknown";
+                ReportError($"subscriber:{subscriber}", ex);
+            }
         }
+    }
 
-        if (AmdGpuMonitor.IsAdlAvailable)
+    private void ReportError(string key, Exception exception)
+    {
+        lock (_logLock)
         {
-            var amd = new AmdGpuMonitor();
-            if (amd.TryInitialize())
-                return amd;
-            amd.Dispose();
+            if (!_reportedErrors.Add(key)) return;
+
+            try
+            {
+                AppPaths.EnsureDataDirectory();
+                RotateLogIfNeeded();
+                File.AppendAllText(
+                    AppPaths.LogPath,
+                    $"[{DateTimeOffset.Now:O}] {key}: {exception}{Environment.NewLine}");
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
         }
+    }
 
-        var windows = new WindowsGpuCounterMonitor();
-        if (windows.TryInitialize())
-            return windows;
-        windows.Dispose();
+    private void ClearReportedError(string key)
+    {
+        lock (_logLock)
+            _reportedErrors.Remove(key);
+    }
 
-        return null;
+    private static void RotateLogIfNeeded()
+    {
+        if (!File.Exists(AppPaths.LogPath) || new FileInfo(AppPaths.LogPath).Length <= MaxLogBytes) return;
+
+        string backupPath = AppPaths.LogPath + ".1";
+        File.Move(AppPaths.LogPath, backupPath, overwrite: true);
+    }
+
+    private static long SecondsToStopwatchTicks(int seconds) => checked((long)seconds * Stopwatch.Frequency);
+
+    private static void UpdateMax(ref float maximum, float current)
+    {
+        if (float.IsFinite(current) && current > maximum)
+            maximum = current;
+    }
+
+    private static void UpdateMax(ref float maximum, float? current)
+    {
+        if (current.HasValue)
+            UpdateMax(ref maximum, current.Value);
+    }
+
+    private static string FormatNumber(float value, string format = "0.0") =>
+        value.ToString(format, CultureInfo.InvariantCulture);
+
+    private static string FormatOptionalNumber(float? value, string format = "0.0") =>
+        value.HasValue ? FormatNumber(value.Value, format) : string.Empty;
+
+    internal static string EscapeSpreadsheetFormula(string value)
+    {
+        ReadOnlySpan<char> trimmed = value.AsSpan().TrimStart();
+        return trimmed.Length > 0 && trimmed[0] is '=' or '+' or '-' or '@' or '\t' or '\r'
+            ? "'" + value
+            : value;
+    }
+
+    internal static string EscapeCsv(string value)
+    {
+        if (value.IndexOfAny([',', '"', '\r', '\n']) < 0)
+            return value;
+
+        return '"' + value.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
     }
 }

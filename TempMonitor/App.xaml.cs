@@ -1,52 +1,85 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Linq;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 
 namespace TempMonitor;
 
+[SuppressMessage(
+    "Design",
+    "CA1001:Types that own disposable fields should be disposable",
+    Justification = "WPF owns the Application lifetime; OnExit deterministically disposes both fields.")]
 public partial class App : System.Windows.Application
 {
-    private const string SingleInstanceMutexName = @"Global\gxTempMonitor.SingleInstance";
+    private const string SingleInstanceMutexName = @"Local\gxTempMonitor.SingleInstance";
+
+    private readonly CancellationTokenSource _startupCancellation = new();
     private Mutex? _singleInstanceMutex;
+    private bool _ownsSingleInstanceMutex;
 
-    protected override void OnStartup(StartupEventArgs e)
+    protected override async void OnStartup(StartupEventArgs e)
     {
-        _singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out bool createdNew);
-        if (!createdNew)
-        {
-            System.Windows.MessageBox.Show("gxTempMonitor 已经在运行。", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-            Shutdown();
-            return;
-        }
-
         base.OnStartup(e);
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
-        int delaySeconds = ParseDelayFromArgs(e);
-        if (delaySeconds <= 0)
-            delaySeconds = ReadDelayFromConfig();
-
-        if (delaySeconds > 0)
+        try
         {
-            _ = Task.Run(async () =>
+            AppConfig config = ConfigStore.Load();
+            int delaySeconds = ParseDelayFromArgs(e);
+            if (delaySeconds < 0 && IsStartupInvocation(e.Args))
+                delaySeconds = config.DelayedStartSeconds;
+            else if (delaySeconds < 0)
+                delaySeconds = 0;
+
+            if (delaySeconds > 0)
             {
-                await Task.Delay(delaySeconds * 1000);
-                Dispatcher.Invoke(() =>
-                {
-                    _ = HardwareMonitorService.Instance;
-                    MainWindow = new MainWindow();
-                    MainWindow.Show();
-                });
-            });
-        }
-        else
-        {
-            _ = HardwareMonitorService.Instance;
-            MainWindow = new MainWindow();
+                await Task.Delay(
+                    TimeSpan.FromSeconds(Math.Clamp(delaySeconds, 0, 60)),
+                    _startupCancellation.Token);
+            }
+
+            if (_startupCancellation.IsCancellationRequested) return;
+
+            // A delayed startup instance must not reserve the single-instance mutex:
+            // a user launching the app manually should be able to start immediately.
+            _singleInstanceMutex = new Mutex(
+                initiallyOwned: true,
+                SingleInstanceMutexName,
+                out bool createdNew);
+            _ownsSingleInstanceMutex = createdNew;
+
+            if (!createdNew)
+            {
+                Shutdown();
+                return;
+            }
+
+            HardwareMonitorService.Instance.Configure(
+                config.SamplingIntervalSeconds,
+                config.TrackTopGpuProcess);
+
+            MainWindow = new MainWindow(config);
             MainWindow.Show();
+        }
+        catch (OperationCanceledException) when (_startupCancellation.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            TryLogStartupFailure(ex);
+            if (!IsStartupInvocation(e.Args))
+            {
+                System.Windows.MessageBox.Show(
+                    "gxTempMonitor 启动失败，详细信息已写入日志。",
+                    "gxTempMonitor",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+
+            Shutdown(1);
         }
     }
 
@@ -54,54 +87,58 @@ public partial class App : System.Windows.Application
     {
         for (int i = 0; i < e.Args.Length - 1; i++)
         {
-            if (string.Equals(e.Args[i], "--delay", StringComparison.OrdinalIgnoreCase))
-            {
-                if (int.TryParse(e.Args[i + 1], out int seconds))
-                    return Math.Clamp(seconds, 0, 60);
-            }
+            if (!string.Equals(e.Args[i], "--delay", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            return int.TryParse(e.Args[i + 1], out int seconds)
+                ? Math.Clamp(seconds, 0, 60)
+                : 0;
         }
+
         return -1;
     }
 
-    private static int ReadDelayFromConfig()
+    private static bool IsStartupInvocation(string[] args) =>
+        args.Any(arg => string.Equals(arg, "--startup", StringComparison.OrdinalIgnoreCase));
+
+    private static void TryLogStartupFailure(Exception exception)
     {
         try
         {
-            string exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName
-                ?? Environment.ProcessPath
-                ?? AppContext.BaseDirectory;
-            string exeDir = System.IO.Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory;
-            string configPath = System.IO.Path.Combine(exeDir, "config.json");
-
-            if (!System.IO.File.Exists(configPath)) return 0;
-
-            var options = new JsonSerializerOptions { Converters = { new JsonStringEnumConverter() } };
-            var config = JsonSerializer.Deserialize<AppConfig>(System.IO.File.ReadAllText(configPath), options);
-            return config?.DelayedStartSeconds ?? 0;
+            AppPaths.EnsureDataDirectory();
+            File.AppendAllText(
+                AppPaths.LogPath,
+                $"[{DateTimeOffset.Now:O}] startup: {exception}{Environment.NewLine}");
         }
-        catch
+        catch (IOException)
         {
-            return 0;
+        }
+        catch (UnauthorizedAccessException)
+        {
         }
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
-        HardwareMonitorService.Instance.Dispose();
+        _startupCancellation.Cancel();
 
-        try
+        if (HardwareMonitorService.IsValueCreated)
+            HardwareMonitorService.Instance.Dispose();
+
+        if (_ownsSingleInstanceMutex)
         {
-            _singleInstanceMutex?.ReleaseMutex();
-        }
-        catch (AbandonedMutexException)
-        {
-        }
-        catch (ApplicationException)
-        {
+            try
+            {
+                _singleInstanceMutex?.ReleaseMutex();
+            }
+            catch (ApplicationException)
+            {
+            }
         }
 
         _singleInstanceMutex?.Dispose();
         _singleInstanceMutex = null;
+        _startupCancellation.Dispose();
         base.OnExit(e);
     }
 }

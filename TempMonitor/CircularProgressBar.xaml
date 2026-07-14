@@ -17,12 +17,6 @@
               StrokeThickness="{Binding ArcStrokeThickness, ElementName=Root}"
               StrokeStartLineCap="Round"
               StrokeEndLineCap="Round">
-            <Path.Effect>
-                <DropShadowEffect BlurRadius="8"
-                                  ShadowDepth="0"
-                                  Opacity="0.7"
-                                  Color="#6600E5FF"/>
-            </Path.Effect>
             <Path.Stroke>
                 <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
                     <GradientStop Color="#00E5FF" Offset="0"/>
