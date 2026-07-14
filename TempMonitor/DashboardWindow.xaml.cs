@@ -1,40 +1,58 @@
 using System;
 using System.ComponentModel;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media.Animation;
 using System.Windows.Media;
+using System.Windows.Threading;
 
 namespace TempMonitor;
 
 public partial class DashboardWindow : Window
 {
     private const int TrendCapacity = 48;
+    private static readonly CubicEase EaseOut = CreateFrozenEaseOut();
 
     private bool _allowClose;
+    private volatile bool _isMonitoring;
+    private int _monitorGeneration;
     private FrameworkElement? _currentView;
-    private readonly Queue<double> _cpuTrend = new();
-    private readonly Queue<double> _gpuTrend = new();
-    private readonly Queue<double> _ramTrend = new();
-    private readonly Queue<double> _vramTrend = new();
-    private readonly Queue<double> _upTrend = new();
-    private readonly Queue<double> _downTrend = new();
+    private DateTime _lastTrendTimestamp = DateTime.MinValue;
+    private readonly TrendBuffer _cpuTrend = new(TrendCapacity);
+    private readonly TrendBuffer _gpuTrend = new(TrendCapacity);
+    private readonly TrendBuffer _ramTrend = new(TrendCapacity);
+    private readonly TrendBuffer _vramTrend = new(TrendCapacity);
+    private readonly TrendBuffer _upTrend = new(TrendCapacity);
+    private readonly TrendBuffer _downTrend = new(TrendCapacity);
 
     public DashboardWindow()
     {
         InitializeComponent();
-        HardwareMonitorService.Instance.DataUpdated += OnDataUpdated;
-        ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
-        NavigationListBox.SelectedIndex = 0;
         _currentView = OverviewView;
         UpdateVisibleSection("Overview", animate: false);
+        NavigationListBox.SelectedIndex = 0;
+        IsVisibleChanged += DashboardWindow_IsVisibleChanged;
     }
 
     public void PrepareForExit()
     {
         _allowClose = true;
+        DetachFromMonitor();
+    }
+
+    private void DashboardWindow_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (IsVisible && !_allowClose)
+        {
+            AttachToMonitor();
+        }
+        else
+        {
+            DetachFromMonitor();
+        }
     }
 
     protected override void OnClosing(CancelEventArgs e)
@@ -42,76 +60,202 @@ public partial class DashboardWindow : Window
         if (!_allowClose)
         {
             e.Cancel = true;
+            DetachFromMonitor();
             Hide();
             return;
         }
 
-        HardwareMonitorService.Instance.DataUpdated -= OnDataUpdated;
+        DetachFromMonitor();
         base.OnClosing(e);
+    }
+
+    protected override void OnClosed(EventArgs e)
+    {
+        DetachFromMonitor();
+        IsVisibleChanged -= DashboardWindow_IsVisibleChanged;
+        base.OnClosed(e);
+    }
+
+    private void AttachToMonitor()
+    {
+        if (_isMonitoring || _allowClose)
+        {
+            return;
+        }
+
+        Interlocked.Increment(ref _monitorGeneration);
+        HardwareMonitorService.Instance.DataUpdated += OnDataUpdated;
+        _isMonitoring = true;
+        ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
+    }
+
+    private void DetachFromMonitor()
+    {
+        if (!_isMonitoring)
+        {
+            return;
+        }
+
+        // Gate callbacks before removing the handler so an in-flight publication is harmless.
+        _isMonitoring = false;
+        Interlocked.Increment(ref _monitorGeneration);
+        HardwareMonitorService.Instance.DataUpdated -= OnDataUpdated;
     }
 
     private void OnDataUpdated(HardwareSnapshot snapshot)
     {
-        Dispatcher.InvokeAsync(() => ApplySnapshot(snapshot));
+        int generation = Volatile.Read(ref _monitorGeneration);
+        if (!_isMonitoring || Dispatcher.HasShutdownStarted)
+        {
+            return;
+        }
+
+        try
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
+            {
+                if (_isMonitoring &&
+                    generation == Volatile.Read(ref _monitorGeneration) &&
+                    IsVisible &&
+                    !_allowClose)
+                {
+                    ApplySnapshot(snapshot);
+                }
+            });
+        }
+        catch (InvalidOperationException)
+        {
+        }
     }
 
     private void ApplySnapshot(HardwareSnapshot snapshot)
     {
-        PushTrend(_cpuTrend, snapshot.CpuUsage);
-        PushTrend(_gpuTrend, snapshot.GpuTemperature ?? 0);
-        PushTrend(_ramTrend, snapshot.RamUsedGb);
-        PushTrend(_vramTrend, snapshot.VramUsedGb ?? 0);
-        PushTrend(_upTrend, snapshot.NetUploadBytesPerSecond);
-        PushTrend(_downTrend, snapshot.NetDownloadBytesPerSecond);
+        RecordTrends(snapshot);
+        ApplyCurrentViewSnapshot(snapshot);
+    }
 
-        ApplyOverviewSnapshot(snapshot);
-        ApplyCpuDetailSnapshot(snapshot);
-        ApplyGpuDetailSnapshot(snapshot);
-        ApplyRamDetailSnapshot(snapshot);
-        ApplyNetworkDetailSnapshot(snapshot);
-        ApplyTrendSnapshot(snapshot);
+    private void RecordTrends(HardwareSnapshot snapshot)
+    {
+        if (snapshot.Timestamp == _lastTrendTimestamp)
+        {
+            return;
+        }
+
+        _lastTrendTimestamp = snapshot.Timestamp;
+        if (snapshot.HasCpuUsage)
+            _cpuTrend.Add(snapshot.CpuUsage);
+        if (snapshot.GpuTemperature.HasValue)
+            _gpuTrend.Add(snapshot.GpuTemperature.Value);
+        if (snapshot.HasRamData)
+            _ramTrend.Add(snapshot.RamUsedGb);
+        if (snapshot.VramUsedGb.HasValue)
+            _vramTrend.Add(snapshot.VramUsedGb.Value);
+        if (snapshot.HasNetworkData)
+        {
+            _upTrend.Add(snapshot.NetUploadBytesPerSecond);
+            _downTrend.Add(snapshot.NetDownloadBytesPerSecond);
+        }
+    }
+
+    private void ApplyCurrentViewSnapshot(HardwareSnapshot snapshot)
+    {
+        if (ReferenceEquals(_currentView, CpuView))
+        {
+            ApplyCpuDetailSnapshot(snapshot);
+        }
+        else if (ReferenceEquals(_currentView, GpuView))
+        {
+            ApplyGpuDetailSnapshot(snapshot);
+        }
+        else if (ReferenceEquals(_currentView, RamView))
+        {
+            ApplyRamDetailSnapshot(snapshot);
+        }
+        else if (ReferenceEquals(_currentView, NetworkView))
+        {
+            ApplyNetworkDetailSnapshot(snapshot);
+        }
+        else
+        {
+            ApplyOverviewSnapshot(snapshot);
+            ApplyTrendSnapshot(snapshot);
+        }
     }
 
     private void ApplyOverviewSnapshot(HardwareSnapshot s)
     {
-        AnimateGauge(CpuGauge, s.CpuUsage);
+        if (s.HasCpuUsage)
+            AnimateGauge(CpuGauge, s.CpuUsage);
+        else
+            SetGaugeUnavailable(CpuGauge);
         CpuTempValueText.Text = "温度 --";
 
-        AnimateGauge(GpuGauge, s.GpuUsagePercent);
+        if (s.HasGpuUsage)
+            AnimateGauge(GpuGauge, s.GpuUsagePercent);
+        else
+            SetGaugeUnavailable(GpuGauge);
         GpuTempValueText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperature);
         GpuTempValueText.Foreground = UiHelper.GetAlertBrush(s.GpuTemperature ?? 0);
         GpuVramValueText.Text = s.VramUsedGb.HasValue
             ? $"显存 {s.VramUsedGb.Value:F1} GB"
             : "显存 --";
 
-        AnimateGauge(RamGauge, s.RamUsagePercent);
-        RamUsedValueText.Text = $"{s.RamUsedGb:F1} / {s.TotalRamGb:F1} GB";
-        RamPercentValueText.Text = $"使用率 {s.RamUsagePercent:0.0} %";
+        if (s.HasRamData)
+        {
+            AnimateGauge(RamGauge, s.RamUsagePercent);
+            RamUsedValueText.Text = $"{s.RamUsedGb:F1} / {s.TotalRamGb:F1} GB";
+            RamPercentValueText.Text = $"使用率 {s.RamUsagePercent:0.0} %";
+        }
+        else
+        {
+            SetGaugeUnavailable(RamGauge);
+            RamUsedValueText.Text = "-- / -- GB";
+            RamPercentValueText.Text = "使用率 --";
+        }
 
-        NetDownValueText.Text = $"↓ {UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond)}";
-        NetUpValueText.Text = $"↑ {UiHelper.FormatSpeed(s.NetUploadBytesPerSecond)}";
+        NetDownValueText.Text = s.HasNetworkData ? $"↓ {UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond)}" : "↓ --";
+        NetUpValueText.Text = s.HasNetworkData ? $"↑ {UiHelper.FormatSpeed(s.NetUploadBytesPerSecond)}" : "↑ --";
         float networkActivity = Math.Min(100, (s.NetDownloadBytesPerSecond + s.NetUploadBytesPerSecond) / 1024f / 1024f * 10f);
         AnimateProgressBar(NetActivityProgressBar, networkActivity);
     }
 
     private void ApplyTrendSnapshot(HardwareSnapshot s)
     {
-        TrendCpuValueText.Text = $"{s.CpuUsage:0.0} %";
+        TrendCpuValueText.Text = s.HasCpuUsage ? $"{s.CpuUsage:0.0} %" : "--";
         TrendGpuValueText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperature);
-        TrendRamValueText.Text = $"{s.RamUsedGb:F1} GB";
+        TrendRamValueText.Text = s.HasRamData ? $"{s.RamUsedGb:F1} GB" : "--";
         TrendVramValueText.Text = s.VramUsedGb.HasValue ? $"{s.VramUsedGb.Value:F1} GB" : "--";
-        TrendUpValueText.Text = UiHelper.FormatSpeed(s.NetUploadBytesPerSecond);
-        TrendDownValueText.Text = UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond);
-        TrendCpuChart.Values = _cpuTrend.ToArray();
-        TrendGpuChart.Values = _gpuTrend.ToArray();
-        TrendRamChart.Values = _ramTrend.ToArray();
-        TrendVramChart.Values = _vramTrend.ToArray();
-        TrendUpChart.Values = _upTrend.ToArray();
-        TrendDownChart.Values = _downTrend.ToArray();
+        TrendUpValueText.Text = s.HasNetworkData ? UiHelper.FormatSpeed(s.NetUploadBytesPerSecond) : "--";
+        TrendDownValueText.Text = s.HasNetworkData ? UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond) : "--";
+        TrendCpuChart.UpdateValues(_cpuTrend);
+        TrendGpuChart.UpdateValues(_gpuTrend);
+        TrendRamChart.UpdateValues(_ramTrend);
+        TrendVramChart.UpdateValues(_vramTrend);
+        TrendUpChart.UpdateValues(_upTrend);
+        TrendDownChart.UpdateValues(_downTrend);
     }
 
     private void ApplyCpuDetailSnapshot(HardwareSnapshot s)
     {
+        if (!s.HasCpuUsage)
+        {
+            CpuDetailUsageText.Text = "--";
+            CpuDetailUsageText.Foreground = UiHelper.NormalBrush;
+            CpuDetailClockText.Text = "频率 --";
+            CpuDetailTemperatureText.Text = "--";
+            CpuDetailPowerText.Text = "功耗 --";
+            CpuDetailMaxUsageText.Text = s.CpuUsageMax > 0 ? $"{s.CpuUsageMax:0.0} %" : "--";
+            CpuDetailMaxTempText.Text = "--";
+            CpuDetailClockChipText.Text = "--";
+            CpuDetailPowerChipText.Text = "--";
+            CpuDetailUsageFootText.Text = "--";
+            CpuDetailTempFootText.Text = "--";
+            CpuDetailPowerFootText.Text = "--";
+            CpuDetailFreqFootText.Text = "--";
+            AnimateProgressBar(CpuDetailUsageProgressBar, 0);
+            return;
+        }
+
         CpuDetailUsageText.Text = $"{s.CpuUsage:0.0} %";
         CpuDetailUsageText.Foreground = UiHelper.GetAlertBrush(s.CpuUsage);
         CpuDetailClockText.Text = "频率 --";
@@ -131,8 +275,10 @@ public partial class DashboardWindow : Window
 
     private void ApplyGpuDetailSnapshot(HardwareSnapshot s)
     {
-        GpuDetailUsageText.Text = $"{s.GpuUsagePercent:0.0} %";
-        GpuDetailUsageText.Foreground = UiHelper.GetAlertBrush(s.GpuUsagePercent);
+        GpuDetailUsageText.Text = s.HasGpuUsage ? $"{s.GpuUsagePercent:0.0} %" : "--";
+        GpuDetailUsageText.Foreground = s.HasGpuUsage
+            ? UiHelper.GetAlertBrush(s.GpuUsagePercent)
+            : UiHelper.NormalBrush;
         GpuDetailVramText.Text = s.VramUsedGb.HasValue
             ? $"显存 {s.VramUsedGb.Value:F1} GB"
             : "显存 --";
@@ -151,15 +297,34 @@ public partial class DashboardWindow : Window
         GpuDetailMaxTempText.Text = UiHelper.FormatOptionalTemp(s.GpuTemperatureMax);
         GpuDetailFanChipText.Text = gpuFanText;
         GpuDetailPowerChipText.Text = gpuPowerText;
-        GpuDetailUsageFootText.Text = $"{s.GpuUsagePercent:0.0} %";
+        GpuDetailUsageFootText.Text = s.HasGpuUsage ? $"{s.GpuUsagePercent:0.0} %" : "--";
         GpuDetailTempFootText.Text = gpuTempText;
         GpuDetailPowerFootText.Text = gpuPowerText;
         GpuDetailFanFootText.Text = gpuFanText;
-        AnimateProgressBar(GpuDetailUsageProgressBar, s.GpuUsagePercent);
+        AnimateProgressBar(GpuDetailUsageProgressBar, s.HasGpuUsage ? s.GpuUsagePercent : 0);
     }
 
     private void ApplyRamDetailSnapshot(HardwareSnapshot s)
     {
+        if (!s.HasRamData)
+        {
+            RamDetailUsedText.Text = "-- / -- GB";
+            RamDetailUsedText.Foreground = UiHelper.NormalBrush;
+            RamDetailPercentText.Text = "使用率 --";
+            RamDetailAvailableText.Text = "-- GB";
+            RamDetailTotalText.Text = "总内存 --";
+            RamDetailPeakText.Text = s.RamUsedMaxGb > 0 ? $"{s.RamUsedMaxGb:F1} GB" : "--";
+            RamDetailHeadroomText.Text = "--";
+            RamDetailPercentChipText.Text = "--";
+            RamDetailAvailChipText.Text = "--";
+            RamDetailUsedFootText.Text = "--";
+            RamDetailAvailFootText.Text = "--";
+            RamDetailPeakFootText.Text = s.RamUsedMaxGb > 0 ? $"{s.RamUsedMaxGb:F1} GB" : "--";
+            RamDetailPercentFootText.Text = "--";
+            AnimateProgressBar(RamDetailUsageProgressBar, 0);
+            return;
+        }
+
         RamDetailUsedText.Text = $"{s.RamUsedGb:F1} / {s.TotalRamGb:F1} GB";
         RamDetailUsedText.Foreground = UiHelper.GetAlertBrush(s.RamUsagePercent);
         RamDetailPercentText.Text = $"使用率 {s.RamUsagePercent:0.0} %";
@@ -178,6 +343,24 @@ public partial class DashboardWindow : Window
 
     private void ApplyNetworkDetailSnapshot(HardwareSnapshot s)
     {
+        if (!s.HasNetworkData)
+        {
+            NetworkDetailDownText.Text = "↓ --";
+            NetworkDetailUpText.Text = "↑ --";
+            NetworkDetailInterfaceText.Text = string.IsNullOrWhiteSpace(s.NetworkInterfaceName) ? "未识别" : s.NetworkInterfaceName;
+            NetworkDetailTotalText.Text = "总吞吐 --";
+            NetworkDetailPeakUpText.Text = s.NetUploadMaxBytesPerSecond > 0 ? UiHelper.FormatSpeed(s.NetUploadMaxBytesPerSecond) : "--";
+            NetworkDetailPeakDownText.Text = s.NetDownloadMaxBytesPerSecond > 0 ? UiHelper.FormatSpeed(s.NetDownloadMaxBytesPerSecond) : "--";
+            NetworkDetailDownChipText.Text = "--";
+            NetworkDetailUpChipText.Text = "--";
+            NetworkDetailInterfaceFootText.Text = NetworkDetailInterfaceText.Text;
+            NetworkDetailTotalFootText.Text = "--";
+            NetworkDetailDownFootText.Text = "--";
+            NetworkDetailUpFootText.Text = "--";
+            AnimateProgressBar(NetworkDetailActivityProgressBar, 0);
+            return;
+        }
+
         NetworkDetailDownText.Text = $"↓ {UiHelper.FormatSpeed(s.NetDownloadBytesPerSecond)}";
         NetworkDetailUpText.Text = $"↑ {UiHelper.FormatSpeed(s.NetUploadBytesPerSecond)}";
         NetworkDetailInterfaceText.Text = string.IsNullOrWhiteSpace(s.NetworkInterfaceName)
@@ -196,34 +379,32 @@ public partial class DashboardWindow : Window
         AnimateProgressBar(NetworkDetailActivityProgressBar, networkActivity);
     }
 
-    private static void PushTrend(Queue<double> queue, double value)
-    {
-        queue.Enqueue(value);
-        while (queue.Count > TrendCapacity)
-        {
-            queue.Dequeue();
-        }
-    }
-
-    private void AnimateGauge(CircularProgressBar gauge, double target)
+    private static void AnimateGauge(CircularProgressBar gauge, double target)
     {
         var animation = new DoubleAnimation
         {
             To = target,
             Duration = TimeSpan.FromSeconds(0.35),
-            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            EasingFunction = EaseOut
         };
 
         gauge.BeginAnimation(CircularProgressBar.ValueProperty, animation, HandoffBehavior.SnapshotAndReplace);
     }
 
-    private void AnimateProgressBar(System.Windows.Controls.ProgressBar progressBar, double target)
+    private static void SetGaugeUnavailable(CircularProgressBar gauge)
+    {
+        gauge.BeginAnimation(CircularProgressBar.ValueProperty, null);
+        gauge.Value = 0;
+        gauge.CenterText = "--";
+    }
+
+    private static void AnimateProgressBar(System.Windows.Controls.ProgressBar progressBar, double target)
     {
         var animation = new DoubleAnimation
         {
             To = target,
             Duration = TimeSpan.FromSeconds(0.3),
-            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            EasingFunction = EaseOut
         };
 
         progressBar.BeginAnimation(System.Windows.Controls.Primitives.RangeBase.ValueProperty, animation, HandoffBehavior.SnapshotAndReplace);
@@ -253,6 +434,11 @@ public partial class DashboardWindow : Window
         if (NavigationListBox.SelectedItem is ListBoxItem item && item.Tag is string target)
         {
             UpdateVisibleSection(target, animate: true);
+
+            if (IsVisible)
+            {
+                ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
+            }
         }
     }
 
@@ -297,21 +483,21 @@ public partial class DashboardWindow : Window
             From = 0,
             To = 1,
             Duration = TimeSpan.FromSeconds(0.25),
-            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            EasingFunction = EaseOut
         };
         var slideIn = new DoubleAnimation
         {
             From = 10,
             To = 0,
             Duration = TimeSpan.FromSeconds(0.25),
-            EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            EasingFunction = EaseOut
         };
 
         nextView.BeginAnimation(OpacityProperty, fadeIn, HandoffBehavior.SnapshotAndReplace);
         nextTransform.BeginAnimation(TranslateTransform.YProperty, slideIn, HandoffBehavior.SnapshotAndReplace);
     }
 
-    private FrameworkElement GetSection(string target) => target switch
+    private Grid GetSection(string target) => target switch
     {
         "Cpu" => CpuView,
         "Gpu" => GpuView,
@@ -332,5 +518,61 @@ public partial class DashboardWindow : Window
         transform = new TranslateTransform();
         element.RenderTransform = transform;
         return transform;
+    }
+
+    private static CubicEase CreateFrozenEaseOut()
+    {
+        var easing = new CubicEase { EasingMode = EasingMode.EaseOut };
+        easing.Freeze();
+        return easing;
+    }
+
+    private sealed class TrendBuffer : IReadOnlyList<double>
+    {
+        private readonly double[] _values;
+        private int _start;
+
+        public TrendBuffer(int capacity)
+        {
+            _values = new double[capacity];
+        }
+
+        public int Count { get; private set; }
+
+        public double this[int index]
+        {
+            get
+            {
+                if ((uint)index >= (uint)Count)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(index));
+                }
+
+                return _values[(_start + index) % _values.Length];
+            }
+        }
+
+        public void Add(double value)
+        {
+            if (Count < _values.Length)
+            {
+                _values[(_start + Count) % _values.Length] = value;
+                Count++;
+                return;
+            }
+
+            _values[_start] = value;
+            _start = (_start + 1) % _values.Length;
+        }
+
+        public IEnumerator<double> GetEnumerator()
+        {
+            for (int i = 0; i < Count; i++)
+            {
+                yield return this[i];
+            }
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
     }
 }

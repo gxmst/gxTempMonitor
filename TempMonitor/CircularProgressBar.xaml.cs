@@ -1,12 +1,15 @@
 using System;
 using System.Windows;
 using System.Windows.Media;
-using System.Windows.Shapes;
 
 namespace TempMonitor;
 
 public partial class CircularProgressBar : System.Windows.Controls.UserControl
 {
+    private readonly ArcSegment _progressArc = new() { SweepDirection = SweepDirection.Clockwise };
+    private readonly PathFigure _progressFigure = new() { IsClosed = false, IsFilled = false };
+    private readonly PathGeometry _progressGeometry = new();
+
     public static readonly DependencyProperty ValueProperty =
         DependencyProperty.Register(nameof(Value), typeof(double), typeof(CircularProgressBar),
             new PropertyMetadata(0d, OnVisualPropertyChanged));
@@ -70,6 +73,11 @@ public partial class CircularProgressBar : System.Windows.Controls.UserControl
     public CircularProgressBar()
     {
         InitializeComponent();
+
+        _progressFigure.Segments.Add(_progressArc);
+        _progressGeometry.Figures.Add(_progressFigure);
+        ProgressPath.Data = _progressGeometry;
+
         SizeChanged += (_, _) => UpdateProgressArc();
         Loaded += (_, _) => UpdateProgressArc();
     }
@@ -88,16 +96,18 @@ public partial class CircularProgressBar : System.Windows.Controls.UserControl
         double size = Math.Max(0, Math.Min(ActualWidth, ActualHeight));
         if (size <= 0 || Maximum <= 0)
         {
-            ProgressPath.Data = Geometry.Empty;
+            ProgressPath.Visibility = Visibility.Hidden;
             return;
         }
 
         double progress = Math.Clamp(Value / Maximum, 0, 1);
         if (progress <= 0)
         {
-            ProgressPath.Data = Geometry.Empty;
+            ProgressPath.Visibility = Visibility.Hidden;
             return;
         }
+
+        ProgressPath.Visibility = Visibility.Visible;
 
         double strokeThickness = ArcStrokeThickness;
         ProgressPath.StrokeThickness = strokeThickness;
@@ -111,16 +121,10 @@ public partial class CircularProgressBar : System.Windows.Controls.UserControl
         System.Windows.Point endPoint = PointOnCircle(center, radius, endAngle);
         bool isLargeArc = progress > 0.5;
 
-        var figure = new PathFigure { StartPoint = startPoint, IsClosed = false, IsFilled = false };
-        figure.Segments.Add(new ArcSegment
-        {
-            Point = endPoint,
-            Size = new System.Windows.Size(radius, radius),
-            SweepDirection = SweepDirection.Clockwise,
-            IsLargeArc = isLargeArc
-        });
-
-        ProgressPath.Data = new PathGeometry([figure]);
+        _progressFigure.StartPoint = startPoint;
+        _progressArc.Point = endPoint;
+        _progressArc.Size = new System.Windows.Size(radius, radius);
+        _progressArc.IsLargeArc = isLargeArc;
     }
 
     private static System.Windows.Point PointOnCircle(System.Windows.Point center, double radius, double angleDegrees)

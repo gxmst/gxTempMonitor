@@ -7,22 +7,35 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- WPF supplies the process entry point; unlike a WinForms entry point it does
+         not apply ApplicationHighDpiMode at startup, so app.manifest must retain the
+         DPI nodes. WFO0003 would otherwise recommend removing the effective setting. -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+
+    <AssemblyName>gxTempMonitor</AssemblyName>
+    <RootNamespace>TempMonitor</RootNamespace>
+    <AssemblyTitle>gxTempMonitor</AssemblyTitle>
+    <Product>gxTempMonitor</Product>
+    <Company>gxmst</Company>
+    <Authors>gxmst</Authors>
+    <Description>Lightweight user-mode Windows hardware monitor widget.</Description>
+    <Copyright>Copyright © 2026 gxmst. All rights reserved.</Copyright>
+    <Version>6.0.0</Version>
+    <AssemblyVersion>6.0.0.0</AssemblyVersion>
+    <FileVersion>6.0.0.0</FileVersion>
+    <InformationalVersion>6.0.0</InformationalVersion>
+    <RepositoryUrl>https://github.com/gxmst/gxTempMonitor</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/gxmst/gxTempMonitor</PackageProjectUrl>
+    <NeutralLanguage>zh-CN</NeutralLanguage>
+
+    <!-- Keep ordinary builds RID-neutral. Publish behavior lives in named profiles. -->
+    <Deterministic>true</Deterministic>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
+    <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
-
-  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
-    <PublishSingleFile>true</PublishSingleFile>
-    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
-    <PublishReadyToRun>true</PublishReadyToRun>
-    <DebugType>none</DebugType>
-    <DebugSymbols>false</DebugSymbols>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <PackageReference Include="System.Management" Version="9.0.0" />
-  </ItemGroup>
-
 </Project>

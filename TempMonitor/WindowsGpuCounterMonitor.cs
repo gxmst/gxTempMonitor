@@ -1,211 +1,690 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
+using System.Globalization;
 
 namespace TempMonitor;
 
 internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
 {
-    private List<PerformanceCounter>? _engineCounters;
-    private PerformanceCounter? _dedicatedUsageCounter;
-    private PerformanceCounter? _dedicatedTotalCounter;
-    private float _lastUsage;
-    private bool _initialized;
+    private const string EngineCategoryName = "GPU Engine";
+    private const string EngineUtilizationCounterName = "Utilization Percentage";
+    private const string MemoryCategoryName = "GPU Adapter Memory";
+    private const string DedicatedUsageCounterName = "Dedicated Usage";
+    private const int MaxEngineInstances = 16_384;
+    private const int MaxMemoryInstances = 256;
+    private const int MaxConsecutiveFailures = 3;
+    private const int CachePruneInterval = 60;
+    private const long MaxPlausibleMemoryBytes = 1L << 50;
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+
+    private readonly object _syncRoot = new();
+    private readonly Dictionary<string, EngineMetadata> _engineMetadata = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, CounterSample> _previousEngineSamples = new(StringComparer.Ordinal);
+    private readonly Dictionary<AdapterKey, float> _smoothedUsage = new();
+
+    private PerformanceCounterCategory? _engineCategory;
+    private PerformanceCounterCategory? _memoryCategory;
+    private AdapterKey? _selectedAdapter;
+    private DateTime _nextRetryUtc = DateTime.MinValue;
+    private int _consecutiveReadFailures;
+    private int _engineReadFailures;
+    private int _memoryReadFailures;
+    private int _readCount;
+    private bool _categoriesReady;
+    private bool _accepted;
+    private bool _healthy;
     private bool _disposed;
 
-    public bool Initialized => _initialized;
+    private readonly record struct AdapterKey(uint LuidHigh, uint LuidLow, int PhysicalAdapter)
+    {
+        public string Identifier =>
+            $"luid_0x{LuidHigh:X8}_0x{LuidLow:X8}_phys_{PhysicalAdapter.ToString(CultureInfo.InvariantCulture)}";
+    }
+
+    private readonly record struct EngineKey(AdapterKey Adapter, int EngineIndex);
+
+    private readonly record struct EngineMetadata(AdapterKey Adapter, int EngineIndex);
+
+    internal static bool TryGetEngineGroupKey(string instanceName, out string groupKey)
+    {
+        if (TryParseEngineKey(instanceName, out AdapterKey adapter, out int engineIndex))
+        {
+            groupKey = $"{adapter.Identifier}_eng_{engineIndex.ToString(CultureInfo.InvariantCulture)}";
+            return true;
+        }
+
+        groupKey = string.Empty;
+        return false;
+    }
+
+    internal static bool TryGetAdapterGroupKey(string instanceName, out string groupKey)
+    {
+        if (TryParseAdapterKey(instanceName, out AdapterKey adapter))
+        {
+            groupKey = adapter.Identifier;
+            return true;
+        }
+
+        groupKey = string.Empty;
+        return false;
+    }
+
+    public bool Initialized
+    {
+        get
+        {
+            lock (_syncRoot)
+                return _accepted && !_disposed;
+        }
+    }
+
+    public bool IsHealthy
+    {
+        get
+        {
+            lock (_syncRoot)
+                return _healthy && _categoriesReady && !_disposed;
+        }
+    }
+
     public string VendorName => "Windows";
 
     public bool TryInitialize()
     {
-        if (_initialized) return true;
-
-        try
+        lock (_syncRoot)
         {
-            _engineCounters = CreateEngineCounters();
-            if (_engineCounters == null || _engineCounters.Count == 0)
+            if (_disposed)
                 return false;
 
-            TryCreateMemoryCounters();
+            if (_categoriesReady)
+                return true;
 
-            foreach (var counter in _engineCounters)
-                counter.NextValue();
-
-            _dedicatedUsageCounter?.NextValue();
-            _dedicatedTotalCounter?.NextValue();
-
-            _initialized = true;
-            return true;
-        }
-        catch
-        {
-            DisposeCounters();
-            return false;
+            return TryInitializeCategories();
         }
     }
 
     public GpuReading Read()
     {
-        if (!_initialized || _disposed)
-            return GpuReading.Empty;
+        lock (_syncRoot)
+        {
+            if (_disposed || !_accepted)
+                return GpuReading.Empty;
 
-        float? usage = null, vramUsed = null, vramTotal = null;
+            if (!_categoriesReady)
+            {
+                if (DateTime.UtcNow < _nextRetryUtc || !TryInitializeCategories())
+                    return GpuReading.Empty;
+            }
+
+            TryRestoreMissingCategory();
+
+            bool engineReadSucceeded = TryReadEngineUsage(out Dictionary<AdapterKey, float> usageByAdapter);
+            bool memoryReadSucceeded = TryReadDedicatedMemory(out Dictionary<AdapterKey, long> memoryByAdapter);
+
+            if (!engineReadSucceeded)
+                RegisterEngineFailure();
+            else
+                _engineReadFailures = 0;
+
+            if (!memoryReadSucceeded)
+                RegisterMemoryFailure();
+            else
+                _memoryReadFailures = 0;
+
+            var adapters = new HashSet<AdapterKey>(usageByAdapter.Keys);
+            adapters.UnionWith(memoryByAdapter.Keys);
+            if (adapters.Count == 0)
+            {
+                RegisterReadFailure();
+                return GpuReading.Empty;
+            }
+
+            _consecutiveReadFailures = 0;
+            _healthy = true;
+
+            AdapterKey selected = SelectAdapter(adapters, usageByAdapter, memoryByAdapter);
+            _selectedAdapter = selected;
+
+            foreach ((AdapterKey adapter, float rawValue) in usageByAdapter)
+            {
+                float rawUsage = Math.Clamp(rawValue, 0, 100);
+                float smoothed = _smoothedUsage.TryGetValue(adapter, out float previous)
+                    ? previous * 0.7f + rawUsage * 0.3f
+                    : rawUsage;
+
+                _smoothedUsage[adapter] = smoothed;
+            }
+
+            float? usage = usageByAdapter.ContainsKey(selected) &&
+                           _smoothedUsage.TryGetValue(selected, out float selectedUsage)
+                ? selectedUsage
+                : null;
+
+            float? vramUsed = null;
+            if (memoryByAdapter.TryGetValue(selected, out long usedBytes))
+                vramUsed = usedBytes / (1024f * 1024f * 1024f);
+
+            PruneAdapterState(adapters);
+
+            return new GpuReading
+            {
+                Temperature = null,
+                Usage = usage,
+                VramUsedGb = vramUsed,
+                // GPU Adapter Memory exposes committed/used memory, not the physical VRAM capacity.
+                VramTotalGb = null,
+                PowerWatts = null,
+                DeviceName = $"Windows GPU ({selected.Identifier})",
+                DeviceIdentifier = selected.Identifier,
+                DeviceIndex = selected.PhysicalAdapter
+            };
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_syncRoot)
+        {
+            if (_disposed)
+                return;
+
+            ResetCategories(scheduleRetry: false);
+            _accepted = false;
+            _healthy = false;
+            _disposed = true;
+        }
+    }
+
+    private bool TryInitializeCategories()
+    {
+        if (DateTime.UtcNow < _nextRetryUtc)
+            return false;
+
+        ResetCategories(scheduleRetry: false);
 
         try
         {
-            if (_engineCounters != null && _engineCounters.Count > 0)
+            bool hasEngineAdapter = false;
+            if (PerformanceCounterCategory.Exists(EngineCategoryName))
             {
-                float maxUsage = 0;
-                foreach (var counter in _engineCounters)
+                _engineCategory = new PerformanceCounterCategory(EngineCategoryName);
+                hasEngineAdapter = TryPrimeEngineSamples();
+                if (!hasEngineAdapter)
+                    _engineCategory = null;
+            }
+
+            bool hasMemoryAdapter = false;
+            if (PerformanceCounterCategory.Exists(MemoryCategoryName))
+            {
+                _memoryCategory = new PerformanceCounterCategory(MemoryCategoryName);
+                hasMemoryAdapter = TryReadDedicatedMemory(out Dictionary<AdapterKey, long> memory) &&
+                                   memory.Count > 0;
+                if (!hasMemoryAdapter)
+                    _memoryCategory = null;
+            }
+
+            if (!hasEngineAdapter && !hasMemoryAdapter)
+            {
+                ResetCategories(scheduleRetry: true);
+                return false;
+            }
+
+            _consecutiveReadFailures = 0;
+            _engineReadFailures = 0;
+            _memoryReadFailures = 0;
+            _nextRetryUtc = DateTime.MinValue;
+            _categoriesReady = true;
+            _accepted = true;
+            _healthy = true;
+            return true;
+        }
+        catch
+        {
+            ResetCategories(scheduleRetry: true);
+            return false;
+        }
+    }
+
+    private bool TryPrimeEngineSamples()
+    {
+        if (_engineCategory == null)
+            return false;
+
+        try
+        {
+            InstanceDataCollectionCollection categoryData = _engineCategory.ReadCategory();
+            InstanceDataCollection? instances = FindCounter(categoryData, EngineUtilizationCounterName);
+            if (instances == null || instances.Count == 0 || instances.Count > MaxEngineInstances)
+                return false;
+
+            bool foundAdapter = false;
+            foreach (DictionaryEntry entry in instances)
+            {
+                if (entry.Key is not string instanceName || entry.Value is not InstanceData instanceData ||
+                    !TryGetEngineMetadata(instanceName, out EngineMetadata metadata))
+                {
+                    continue;
+                }
+
+                _previousEngineSamples[instanceName] = instanceData.Sample;
+                foundAdapter = true;
+            }
+
+            return foundAdapter;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool TryReadEngineUsage(out Dictionary<AdapterKey, float> usageByAdapter)
+    {
+        usageByAdapter = new Dictionary<AdapterKey, float>();
+        if (_engineCategory == null)
+            return false;
+
+        try
+        {
+            InstanceDataCollectionCollection categoryData = _engineCategory.ReadCategory();
+            InstanceDataCollection? instances = FindCounter(categoryData, EngineUtilizationCounterName);
+            if (instances == null || instances.Count > MaxEngineInstances)
+                return false;
+
+            var engineTotals = new Dictionary<EngineKey, float>();
+            var currentInstances = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (DictionaryEntry entry in instances)
+            {
+                if (entry.Key is not string instanceName || entry.Value is not InstanceData instanceData ||
+                    !TryGetEngineMetadata(instanceName, out EngineMetadata metadata))
+                {
+                    continue;
+                }
+
+                currentInstances.Add(instanceName);
+                usageByAdapter.TryAdd(metadata.Adapter, 0);
+
+                CounterSample currentSample = instanceData.Sample;
+                if (_previousEngineSamples.TryGetValue(instanceName, out CounterSample previousSample) &&
+                    currentSample.RawValue >= previousSample.RawValue)
                 {
                     try
                     {
-                        float val = counter.NextValue();
-                        if (val > maxUsage)
-                            maxUsage = val;
+                        float value = CounterSample.Calculate(previousSample, currentSample);
+                        if (float.IsFinite(value) && value >= 0)
+                        {
+                            var key = new EngineKey(metadata.Adapter, metadata.EngineIndex);
+                            engineTotals.TryGetValue(key, out float total);
+                            engineTotals[key] = total + value;
+                        }
                     }
                     catch
                     {
                     }
                 }
 
-                _lastUsage = _lastUsage * 0.7f + maxUsage * 0.3f;
-                usage = _lastUsage;
+                _previousEngineSamples[instanceName] = currentSample;
             }
 
-            if (_dedicatedUsageCounter != null)
+            foreach ((EngineKey engine, float total) in engineTotals)
             {
-                try
+                float clampedTotal = Math.Clamp(total, 0, 100);
+                if (!usageByAdapter.TryGetValue(engine.Adapter, out float busiestEngine) ||
+                    clampedTotal > busiestEngine)
                 {
-                    float usedBytes = _dedicatedUsageCounter.NextValue();
-                    if (usedBytes > 0)
-                        vramUsed = usedBytes / (1024f * 1024f * 1024f);
-                }
-                catch
-                {
+                    usageByAdapter[engine.Adapter] = clampedTotal;
                 }
             }
 
-            if (_dedicatedTotalCounter != null)
-            {
-                try
-                {
-                    float totalBytes = _dedicatedTotalCounter.NextValue();
-                    if (totalBytes > 0)
-                        vramTotal = totalBytes / (1024f * 1024f * 1024f);
-                }
-                catch
-                {
-                }
-            }
+            _readCount++;
+            if (_readCount % CachePruneInterval == 0)
+                PruneEngineCache(currentInstances);
+
+            return true;
         }
         catch
         {
-            _initialized = false;
+            usageByAdapter.Clear();
+            return false;
         }
-
-        return new GpuReading
-        {
-            Temperature = null,
-            Usage = usage,
-            VramUsedGb = vramUsed,
-            VramTotalGb = vramTotal,
-            PowerWatts = null
-        };
     }
 
-    public void Dispose()
+    private bool TryReadDedicatedMemory(out Dictionary<AdapterKey, long> memoryByAdapter)
     {
-        if (_disposed) return;
-        _disposed = true;
-        _initialized = false;
-        DisposeCounters();
-    }
+        memoryByAdapter = new Dictionary<AdapterKey, long>();
+        if (_memoryCategory == null)
+            return false;
 
-    private void DisposeCounters()
-    {
-        if (_engineCounters != null)
-        {
-            foreach (var c in _engineCounters)
-                try { c.Dispose(); } catch { }
-            _engineCounters = null;
-        }
-
-        try { _dedicatedUsageCounter?.Dispose(); } catch { }
-        try { _dedicatedTotalCounter?.Dispose(); } catch { }
-        _dedicatedUsageCounter = null;
-        _dedicatedTotalCounter = null;
-    }
-
-    private List<PerformanceCounter>? CreateEngineCounters()
-    {
         try
         {
-            var category = new PerformanceCounterCategory("GPU Engine");
-            string[] instances = category.GetInstanceNames();
-            if (instances.Length == 0)
-                return null;
+            InstanceDataCollectionCollection categoryData = _memoryCategory.ReadCategory();
+            InstanceDataCollection? instances = FindCounter(categoryData, DedicatedUsageCounterName);
+            if (instances == null || instances.Count > MaxMemoryInstances)
+                return false;
 
-            var counters = new List<PerformanceCounter>();
-            var seenLuids = new HashSet<string>(StringComparer.Ordinal);
-
-            foreach (string instance in instances)
+            foreach (DictionaryEntry entry in instances)
             {
-                if (!instance.Contains("engtype_3D", StringComparison.OrdinalIgnoreCase) &&
-                    !instance.Contains("engtype_Compute", StringComparison.OrdinalIgnoreCase) &&
-                    !instance.Contains("engtype_VideoEncode", StringComparison.OrdinalIgnoreCase) &&
-                    !instance.Contains("engtype_VideoDecode", StringComparison.OrdinalIgnoreCase))
+                if (entry.Key is not string instanceName || entry.Value is not InstanceData instanceData ||
+                    !TryParseAdapterKey(instanceName, out AdapterKey adapter))
+                {
+                    continue;
+                }
+
+                long rawValue = instanceData.RawValue;
+                if (rawValue < 0 || rawValue > MaxPlausibleMemoryBytes)
                     continue;
 
-                int luidEnd = instance.IndexOf("_", StringComparison.Ordinal);
-                if (luidEnd < 0) continue;
+                memoryByAdapter.TryGetValue(adapter, out long existing);
+                if (existing > MaxPlausibleMemoryBytes - rawValue)
+                    continue;
 
-                string luid = instance.Substring(0, luidEnd);
-                if (!seenLuids.Add(luid)) continue;
-
-                try
-                {
-                    var counter = new PerformanceCounter("GPU Engine", "Utilization Percentage", instance);
-                    counters.Add(counter);
-                }
-                catch
-                {
-                }
+                memoryByAdapter[adapter] = existing + rawValue;
             }
 
-            return counters.Count > 0 ? counters : null;
+            return true;
         }
         catch
         {
-            return null;
+            memoryByAdapter.Clear();
+            return false;
         }
     }
 
-    private void TryCreateMemoryCounters()
+    private void TryRestoreMissingCategory()
     {
-        try
+        if (DateTime.UtcNow < _nextRetryUtc)
+            return;
+
+        bool stillMissing = false;
+
+        if (_engineCategory == null)
         {
-            var category = new PerformanceCounterCategory("GPU Adapter Memory");
-            string[] instances = category.GetInstanceNames();
-            if (instances.Length == 0) return;
-
-            string firstInstance = instances[0];
-
             try
             {
-                _dedicatedUsageCounter = new PerformanceCounter("GPU Adapter Memory", "Dedicated Usage", firstInstance);
+                if (PerformanceCounterCategory.Exists(EngineCategoryName))
+                {
+                    _engineCategory = new PerformanceCounterCategory(EngineCategoryName);
+                    if (!TryPrimeEngineSamples())
+                        _engineCategory = null;
+                }
             }
-            catch { }
+            catch
+            {
+                _engineCategory = null;
+            }
 
+            stillMissing |= _engineCategory == null;
+        }
+
+        if (_memoryCategory == null)
+        {
             try
             {
-                _dedicatedTotalCounter = new PerformanceCounter("GPU Adapter Memory", "Dedicated Total", firstInstance);
+                if (PerformanceCounterCategory.Exists(MemoryCategoryName))
+                {
+                    _memoryCategory = new PerformanceCounterCategory(MemoryCategoryName);
+                    if (!TryReadDedicatedMemory(out Dictionary<AdapterKey, long> memory) || memory.Count == 0)
+                        _memoryCategory = null;
+                }
             }
-            catch { }
+            catch
+            {
+                _memoryCategory = null;
+            }
+
+            stillMissing |= _memoryCategory == null;
         }
-        catch
+
+        _nextRetryUtc = stillMissing ? DateTime.UtcNow + RetryDelay : DateTime.MinValue;
+    }
+
+    private void RegisterEngineFailure()
+    {
+        if (_engineCategory == null)
+            return;
+
+        _engineReadFailures++;
+        if (_engineReadFailures < MaxConsecutiveFailures)
+            return;
+
+        _engineCategory = null;
+        _engineReadFailures = 0;
+        _engineMetadata.Clear();
+        _previousEngineSamples.Clear();
+        _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+    }
+
+    private void RegisterMemoryFailure()
+    {
+        if (_memoryCategory == null)
+            return;
+
+        _memoryReadFailures++;
+        if (_memoryReadFailures < MaxConsecutiveFailures)
+            return;
+
+        _memoryCategory = null;
+        _memoryReadFailures = 0;
+        _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+    }
+
+    private void RegisterReadFailure()
+    {
+        _healthy = false;
+        _consecutiveReadFailures++;
+        if (_consecutiveReadFailures >= MaxConsecutiveFailures)
+            ResetCategories(scheduleRetry: true);
+    }
+
+    private void ResetCategories(bool scheduleRetry)
+    {
+        _engineCategory = null;
+        _memoryCategory = null;
+        _engineMetadata.Clear();
+        _previousEngineSamples.Clear();
+        _smoothedUsage.Clear();
+        _selectedAdapter = null;
+        _categoriesReady = false;
+        _healthy = false;
+        _consecutiveReadFailures = 0;
+        _engineReadFailures = 0;
+        _memoryReadFailures = 0;
+
+        if (scheduleRetry)
+            _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+    }
+
+    private AdapterKey SelectAdapter(
+        HashSet<AdapterKey> adapters,
+        Dictionary<AdapterKey, float> usageByAdapter,
+        Dictionary<AdapterKey, long> memoryByAdapter)
+    {
+        using HashSet<AdapterKey>.Enumerator enumerator = adapters.GetEnumerator();
+        enumerator.MoveNext();
+        AdapterKey best = enumerator.Current;
+        while (enumerator.MoveNext())
         {
+            if (IsMoreActive(enumerator.Current, best, usageByAdapter, memoryByAdapter))
+                best = enumerator.Current;
         }
+
+        if (!_selectedAdapter.HasValue || !adapters.Contains(_selectedAdapter.Value) ||
+            _selectedAdapter.Value.Equals(best))
+        {
+            return best;
+        }
+
+        AdapterKey current = _selectedAdapter.Value;
+        usageByAdapter.TryGetValue(current, out float currentUsage);
+        usageByAdapter.TryGetValue(best, out float bestUsage);
+        if (bestUsage > currentUsage + 5f)
+            return best;
+
+        memoryByAdapter.TryGetValue(current, out long currentMemory);
+        memoryByAdapter.TryGetValue(best, out long bestMemory);
+        if (currentUsage < 1f && bestUsage < 1f && bestMemory > currentMemory + 256L * 1024L * 1024L)
+            return best;
+
+        return current;
+    }
+
+    private static bool IsMoreActive(
+        AdapterKey candidate,
+        AdapterKey current,
+        Dictionary<AdapterKey, float> usageByAdapter,
+        Dictionary<AdapterKey, long> memoryByAdapter)
+    {
+        usageByAdapter.TryGetValue(candidate, out float candidateUsage);
+        usageByAdapter.TryGetValue(current, out float currentUsage);
+        if (Math.Abs(candidateUsage - currentUsage) > 0.01f)
+            return candidateUsage > currentUsage;
+
+        memoryByAdapter.TryGetValue(candidate, out long candidateMemory);
+        memoryByAdapter.TryGetValue(current, out long currentMemory);
+        if (candidateMemory != currentMemory)
+            return candidateMemory > currentMemory;
+
+        int highComparison = candidate.LuidHigh.CompareTo(current.LuidHigh);
+        if (highComparison != 0)
+            return highComparison < 0;
+
+        int lowComparison = candidate.LuidLow.CompareTo(current.LuidLow);
+        if (lowComparison != 0)
+            return lowComparison < 0;
+
+        return candidate.PhysicalAdapter < current.PhysicalAdapter;
+    }
+
+    private bool TryGetEngineMetadata(string instanceName, out EngineMetadata metadata)
+    {
+        if (_engineMetadata.TryGetValue(instanceName, out metadata))
+            return true;
+
+        if (!TryParseEngineKey(instanceName, out AdapterKey adapter, out int engineIndex))
+        {
+            metadata = default;
+            return false;
+        }
+
+        metadata = new EngineMetadata(adapter, engineIndex);
+        _engineMetadata[instanceName] = metadata;
+        return true;
+    }
+
+    private static bool TryParseAdapterKey(string instanceName, out AdapterKey adapter)
+    {
+        string[] tokens = instanceName.Split('_', StringSplitOptions.RemoveEmptyEntries);
+        return TryParseAdapterTokens(tokens, out adapter);
+    }
+
+    private static bool TryParseEngineKey(
+        string instanceName,
+        out AdapterKey adapter,
+        out int engineIndex)
+    {
+        string[] tokens = instanceName.Split('_', StringSplitOptions.RemoveEmptyEntries);
+        int enginePosition = FindToken(tokens, "eng");
+        if (enginePosition < 0 || enginePosition + 1 >= tokens.Length ||
+            FindToken(tokens, "engtype") < 0 ||
+            !int.TryParse(
+                tokens[enginePosition + 1],
+                NumberStyles.Integer,
+                CultureInfo.InvariantCulture,
+                out engineIndex) ||
+            engineIndex < 0 || !TryParseAdapterTokens(tokens, out adapter))
+        {
+            adapter = default;
+            engineIndex = 0;
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool TryParseAdapterTokens(string[] tokens, out AdapterKey adapter)
+    {
+        int luidPosition = FindToken(tokens, "luid");
+        int physicalPosition = FindToken(tokens, "phys");
+        if (luidPosition < 0 || luidPosition + 2 >= tokens.Length ||
+            physicalPosition < 0 || physicalPosition + 1 >= tokens.Length ||
+            !TryParseHexUInt32(tokens[luidPosition + 1], out uint luidHigh) ||
+            !TryParseHexUInt32(tokens[luidPosition + 2], out uint luidLow) ||
+            !int.TryParse(tokens[physicalPosition + 1], NumberStyles.Integer, CultureInfo.InvariantCulture, out int physical) ||
+            physical < 0)
+        {
+            adapter = default;
+            return false;
+        }
+
+        adapter = new AdapterKey(luidHigh, luidLow, physical);
+        return true;
+    }
+
+    private static int FindToken(string[] tokens, string value)
+    {
+        for (int i = 0; i < tokens.Length; i++)
+        {
+            if (string.Equals(tokens[i], value, StringComparison.OrdinalIgnoreCase))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private static bool TryParseHexUInt32(string value, out uint result)
+    {
+        ReadOnlySpan<char> span = value.AsSpan();
+        if (span.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            span = span[2..];
+
+        return uint.TryParse(span, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out result);
+    }
+
+    private static InstanceDataCollection? FindCounter(
+        InstanceDataCollectionCollection categoryData,
+        string counterName)
+    {
+        foreach (object key in categoryData.Keys)
+        {
+            if (key is string name && string.Equals(name, counterName, StringComparison.OrdinalIgnoreCase))
+                return categoryData[name];
+        }
+
+        return null;
+    }
+
+    private void PruneEngineCache(HashSet<string> currentInstances)
+    {
+        var staleInstances = new List<string>();
+        foreach (string instanceName in _previousEngineSamples.Keys)
+        {
+            if (!currentInstances.Contains(instanceName))
+                staleInstances.Add(instanceName);
+        }
+
+        foreach (string instanceName in staleInstances)
+        {
+            _previousEngineSamples.Remove(instanceName);
+            _engineMetadata.Remove(instanceName);
+        }
+    }
+
+    private void PruneAdapterState(HashSet<AdapterKey> currentAdapters)
+    {
+        if (_readCount % CachePruneInterval != 0)
+            return;
+
+        var staleAdapters = new List<AdapterKey>();
+        foreach (AdapterKey adapter in _smoothedUsage.Keys)
+        {
+            if (!currentAdapters.Contains(adapter))
+                staleAdapters.Add(adapter);
+        }
+
+        foreach (AdapterKey adapter in staleAdapters)
+            _smoothedUsage.Remove(adapter);
     }
 }

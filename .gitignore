@@ -4,3 +4,7 @@ publish*/
 *.pdb
 bin/
 obj/
+TestResults/
+.vs/
+*.user
+*.suo

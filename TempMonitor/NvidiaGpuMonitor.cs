@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace TempMonitor;
 
@@ -8,33 +10,62 @@ internal sealed class NvidiaGpuMonitor : IGpuMonitor
 {
     private const int NvmlSuccess = 0;
     private const int NvmlTempGpu = 0;
+    private const int MaxNvmlDevices = 64;
+    private const int MaxConsecutiveReadFailures = 3;
+    private const int NvmlStringBufferSize = 256;
+    private const ulong MaxPlausibleVramBytes = 1UL << 50;
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
 
-    private static readonly IntPtr NvmlLib;
-    private static readonly NvmlInitFn? NvmlInit;
-    private static readonly NvmlShutdownFn? NvmlShutdown;
-    private static readonly NvmlDeviceGetCountFn? NvmlGetCount;
-    private static readonly NvmlDeviceGetHandleByIndexFn? NvmlGetHandle;
-    private static readonly NvmlDeviceGetTemperatureFn? NvmlGetTemp;
-    private static readonly NvmlDeviceGetUtilizationFn? NvmlGetUtil;
-    private static readonly NvmlDeviceGetMemoryInfoFn? NvmlGetMem;
-    private static readonly NvmlDeviceGetPowerUsageFn? NvmlGetPower;
+    private readonly object _syncRoot = new();
+    private readonly List<DeviceState> _devices = new();
 
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    private IntPtr _libraryHandle;
+    private NvmlInitFn? _nvmlInit;
+    private NvmlShutdownFn? _nvmlShutdown;
+    private NvmlDeviceGetCountFn? _nvmlGetCount;
+    private NvmlDeviceGetHandleByIndexFn? _nvmlGetHandle;
+    private NvmlDeviceGetTemperatureFn? _nvmlGetTemperature;
+    private NvmlDeviceGetUtilizationFn? _nvmlGetUtilization;
+    private NvmlDeviceGetMemoryInfoFn? _nvmlGetMemoryInfo;
+    private NvmlDeviceGetPowerUsageFn? _nvmlGetPowerUsage;
+    private NvmlDeviceGetStringFn? _nvmlGetName;
+    private NvmlDeviceGetStringFn? _nvmlGetUuid;
+
+    private int _selectedDevicePosition = -1;
+    private int _consecutiveReadFailures;
+    private DateTime _nextRetryUtc = DateTime.MinValue;
+    private bool _nvmlInitialized;
+    private bool _sessionReady;
+    private bool _accepted;
+    private bool _healthy;
+    private bool _disposed;
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int NvmlInitFn();
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int NvmlShutdownFn();
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int NvmlDeviceGetCountFn(ref uint count);
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate int NvmlDeviceGetHandleByIndexFn(uint index, out IntPtr device);
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int NvmlDeviceGetTemperatureFn(IntPtr device, int type, out uint temp);
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int NvmlDeviceGetUtilizationFn(IntPtr device, out NvmlUtilization util);
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int NvmlDeviceGetMemoryInfoFn(IntPtr device, out NvmlMemory mem);
-    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
-    private delegate int NvmlDeviceGetPowerUsageFn(IntPtr device, out uint powerMw);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int NvmlDeviceGetTemperatureFn(IntPtr device, int type, out uint temperature);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int NvmlDeviceGetUtilizationFn(IntPtr device, out NvmlUtilization utilization);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int NvmlDeviceGetMemoryInfoFn(IntPtr device, out NvmlMemory memory);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int NvmlDeviceGetPowerUsageFn(IntPtr device, out uint powerMilliwatts);
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    private delegate int NvmlDeviceGetStringFn(IntPtr device, IntPtr buffer, uint length);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NvmlUtilization
@@ -51,93 +82,267 @@ internal sealed class NvidiaGpuMonitor : IGpuMonitor
         public ulong Used;
     }
 
-    public static bool IsNvmlAvailable => NvmlLib != IntPtr.Zero && NvmlInit != null;
-
-    static NvidiaGpuMonitor()
+    private sealed class DeviceState
     {
-        NvmlLib = TryLoadNvmlLibrary();
-        if (NvmlLib == IntPtr.Zero) return;
-
-        NvmlInit = GetExport<NvmlInitFn>("nvmlInit_v2");
-        NvmlShutdown = GetExport<NvmlShutdownFn>("nvmlShutdown");
-        NvmlGetCount = GetExport<NvmlDeviceGetCountFn>("nvmlDeviceGetCount_v2");
-        NvmlGetHandle = GetExport<NvmlDeviceGetHandleByIndexFn>("nvmlDeviceGetHandleByIndex_v2");
-        NvmlGetTemp = GetExport<NvmlDeviceGetTemperatureFn>("nvmlDeviceGetTemperature");
-        NvmlGetUtil = GetExport<NvmlDeviceGetUtilizationFn>("nvmlDeviceGetUtilizationRates");
-        NvmlGetMem = GetExport<NvmlDeviceGetMemoryInfoFn>("nvmlDeviceGetMemoryInfo");
-        NvmlGetPower = GetExport<NvmlDeviceGetPowerUsageFn>("nvmlDeviceGetPowerUsage");
+        public required IntPtr Handle { get; init; }
+        public required uint Index { get; init; }
+        public required string Name { get; init; }
+        public required string Identifier { get; init; }
     }
 
-    private IntPtr _deviceHandle;
-    private bool _initialized;
-    private bool _disposed;
+    private readonly struct DeviceSample
+    {
+        public required int Position { get; init; }
+        public required DeviceState Device { get; init; }
+        public required bool NativeCallSucceeded { get; init; }
+        public float? Temperature { get; init; }
+        public float? Usage { get; init; }
+        public float? VramUsedGb { get; init; }
+        public float? VramTotalGb { get; init; }
+        public float? PowerWatts { get; init; }
+    }
 
-    public bool Initialized => _initialized;
+    public static bool IsNvmlAvailable => FindTrustedNvmlPath() != null;
+
+    public bool Initialized
+    {
+        get
+        {
+            lock (_syncRoot)
+                return _accepted && !_disposed;
+        }
+    }
+
+    public bool IsHealthy
+    {
+        get
+        {
+            lock (_syncRoot)
+                return _healthy && _sessionReady && !_disposed;
+        }
+    }
+
     public string VendorName => "NVIDIA";
 
     public bool TryInitialize()
     {
-        if (_initialized) return true;
-        if (NvmlInit == null) return false;
-
-        try
+        lock (_syncRoot)
         {
-            if (NvmlInit() != NvmlSuccess) return false;
-
-            uint count = 0;
-            if (NvmlGetCount == null || NvmlGetCount(ref count) != NvmlSuccess || count == 0)
-            {
-                TryShutdown();
+            if (_disposed)
                 return false;
-            }
 
-            if (NvmlGetHandle == null || NvmlGetHandle(0, out _deviceHandle) != NvmlSuccess)
-            {
-                TryShutdown();
-                return false;
-            }
+            if (_sessionReady)
+                return true;
 
-            _initialized = true;
-            return true;
-        }
-        catch
-        {
-            return false;
+            return TryInitializeSession();
         }
     }
 
     public GpuReading Read()
     {
-        if (!_initialized || _disposed)
-            return GpuReading.Empty;
+        lock (_syncRoot)
+        {
+            if (_disposed || !_accepted)
+                return GpuReading.Empty;
 
-        float? temp = null, usage = null, vramUsed = null, vramTotal = null, power = null;
+            if (!_sessionReady)
+            {
+                if (DateTime.UtcNow < _nextRetryUtc || !TryInitializeSession())
+                    return GpuReading.Empty;
+            }
+
+            try
+            {
+                var samples = new List<DeviceSample>(_devices.Count);
+                for (int position = 0; position < _devices.Count; position++)
+                {
+                    DeviceSample sample = ReadDevice(position, _devices[position]);
+                    if (sample.NativeCallSucceeded)
+                        samples.Add(sample);
+                }
+
+                if (samples.Count == 0)
+                {
+                    RegisterReadFailure();
+                    return GpuReading.Empty;
+                }
+
+                _consecutiveReadFailures = 0;
+                _healthy = true;
+
+                DeviceSample selected = SelectDevice(samples);
+                _selectedDevicePosition = selected.Position;
+
+                return new GpuReading
+                {
+                    Temperature = selected.Temperature,
+                    Usage = selected.Usage,
+                    VramUsedGb = selected.VramUsedGb,
+                    VramTotalGb = selected.VramTotalGb,
+                    PowerWatts = selected.PowerWatts,
+                    DeviceName = selected.Device.Name,
+                    DeviceIdentifier = selected.Device.Identifier,
+                    DeviceIndex = checked((int)selected.Device.Index)
+                };
+            }
+            catch
+            {
+                RegisterReadFailure();
+                return GpuReading.Empty;
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        lock (_syncRoot)
+        {
+            if (_disposed)
+                return;
+
+            ResetSession(scheduleRetry: false);
+            UnloadLibrary();
+            _accepted = false;
+            _healthy = false;
+            _disposed = true;
+        }
+    }
+
+    private bool TryInitializeSession()
+    {
+        if (DateTime.UtcNow < _nextRetryUtc)
+            return false;
 
         try
         {
-            if (NvmlGetTemp != null && NvmlGetTemp(_deviceHandle, NvmlTempGpu, out uint t) == NvmlSuccess)
-                temp = t;
-
-            if (NvmlGetUtil != null && NvmlGetUtil(_deviceHandle, out NvmlUtilization u) == NvmlSuccess)
-                usage = u.Gpu;
-
-            if (NvmlGetMem != null && NvmlGetMem(_deviceHandle, out NvmlMemory m) == NvmlSuccess)
+            if (!EnsureLibraryLoaded() || _nvmlInit == null || _nvmlGetCount == null ||
+                _nvmlGetHandle == null || _nvmlShutdown == null)
             {
-                vramUsed = m.Used / (1024f * 1024f * 1024f);
-                vramTotal = m.Total / (1024f * 1024f * 1024f);
+                ScheduleRetry();
+                return false;
             }
 
-            if (NvmlGetPower != null && NvmlGetPower(_deviceHandle, out uint mw) == NvmlSuccess)
-                power = mw / 1000f;
+            if (_nvmlInit() != NvmlSuccess)
+            {
+                ScheduleRetry();
+                return false;
+            }
+
+            _nvmlInitialized = true;
+
+            uint count = 0;
+            if (_nvmlGetCount(ref count) != NvmlSuccess || count == 0 || count > MaxNvmlDevices)
+            {
+                ResetSession(scheduleRetry: true);
+                return false;
+            }
+
+            _devices.Clear();
+            for (uint index = 0; index < count; index++)
+            {
+                if (_nvmlGetHandle(index, out IntPtr handle) != NvmlSuccess || handle == IntPtr.Zero)
+                    continue;
+
+                string name = TryReadDeviceString(_nvmlGetName, handle) ?? $"NVIDIA GPU {index}";
+                string identifier = TryReadDeviceString(_nvmlGetUuid, handle) ?? $"nvml:{index}";
+                _devices.Add(new DeviceState
+                {
+                    Handle = handle,
+                    Index = index,
+                    Name = name,
+                    Identifier = identifier
+                });
+            }
+
+            if (_devices.Count == 0)
+            {
+                ResetSession(scheduleRetry: true);
+                return false;
+            }
+
+            // Do not claim the provider if the loaded DLL cannot actually read any device.
+            // This lets the service choose the Windows counter fallback immediately instead
+            // of being stuck behind an ABI-compatible but unusable NVML installation.
+            for (int position = _devices.Count - 1; position >= 0; position--)
+            {
+                DeviceSample probe = ReadDevice(position, _devices[position]);
+                if (!probe.NativeCallSucceeded)
+                    _devices.RemoveAt(position);
+            }
+
+            if (_devices.Count == 0)
+            {
+                ResetSession(scheduleRetry: true);
+                return false;
+            }
+
+            _selectedDevicePosition = -1;
+            _consecutiveReadFailures = 0;
+            _nextRetryUtc = DateTime.MinValue;
+            _sessionReady = true;
+            _accepted = true;
+            _healthy = true;
+            return true;
         }
         catch
         {
-            _initialized = false;
+            ResetSession(scheduleRetry: true);
+            return false;
+        }
+    }
+
+    private DeviceSample ReadDevice(int position, DeviceState device)
+    {
+        bool callSucceeded = false;
+        float? temperature = null;
+        float? usage = null;
+        float? vramUsed = null;
+        float? vramTotal = null;
+        float? power = null;
+
+        if (_nvmlGetTemperature != null &&
+            _nvmlGetTemperature(device.Handle, NvmlTempGpu, out uint rawTemperature) == NvmlSuccess)
+        {
+            callSucceeded = true;
+            if (rawTemperature <= 150)
+                temperature = rawTemperature;
         }
 
-        return new GpuReading
+        if (_nvmlGetUtilization != null &&
+            _nvmlGetUtilization(device.Handle, out NvmlUtilization rawUtilization) == NvmlSuccess)
         {
-            Temperature = temp,
+            callSucceeded = true;
+            if (rawUtilization.Gpu <= 100)
+                usage = rawUtilization.Gpu;
+        }
+
+        if (_nvmlGetMemoryInfo != null &&
+            _nvmlGetMemoryInfo(device.Handle, out NvmlMemory rawMemory) == NvmlSuccess)
+        {
+            callSucceeded = true;
+            if (rawMemory.Total is > 0 and <= MaxPlausibleVramBytes &&
+                rawMemory.Used <= rawMemory.Total)
+            {
+                const float bytesPerGiB = 1024f * 1024f * 1024f;
+                vramUsed = rawMemory.Used / bytesPerGiB;
+                vramTotal = rawMemory.Total / bytesPerGiB;
+            }
+        }
+
+        if (_nvmlGetPowerUsage != null &&
+            _nvmlGetPowerUsage(device.Handle, out uint rawPowerMilliwatts) == NvmlSuccess)
+        {
+            callSucceeded = true;
+            if (rawPowerMilliwatts <= 5_000_000)
+                power = rawPowerMilliwatts / 1000f;
+        }
+
+        return new DeviceSample
+        {
+            Position = position,
+            Device = device,
+            NativeCallSucceeded = callSucceeded,
+            Temperature = temperature,
             Usage = usage,
             VramUsedGb = vramUsed,
             VramTotalGb = vramTotal,
@@ -145,41 +350,249 @@ internal sealed class NvidiaGpuMonitor : IGpuMonitor
         };
     }
 
-    public void Dispose()
+    private DeviceSample SelectDevice(List<DeviceSample> samples)
     {
-        if (_disposed) return;
-        _disposed = true;
-        if (_initialized) TryShutdown();
-        _initialized = false;
+        DeviceSample best = samples[0];
+        for (int i = 1; i < samples.Count; i++)
+        {
+            if (IsMoreActive(samples[i], best))
+                best = samples[i];
+        }
+
+        DeviceSample? current = null;
+        foreach (DeviceSample sample in samples)
+        {
+            if (sample.Position == _selectedDevicePosition)
+            {
+                current = sample;
+                break;
+            }
+        }
+
+        if (!current.HasValue || current.Value.Position == best.Position)
+            return best;
+
+        float currentUsage = current.Value.Usage ?? 0;
+        float bestUsage = best.Usage ?? 0;
+        if (bestUsage > currentUsage + 5f)
+            return best;
+
+        float currentPower = current.Value.PowerWatts ?? 0;
+        float bestPower = best.PowerWatts ?? 0;
+        if (currentUsage < 1f && bestUsage < 1f && bestPower > currentPower + 10f)
+            return best;
+
+        float currentMemory = current.Value.VramUsedGb ?? 0;
+        float bestMemory = best.VramUsedGb ?? 0;
+        if (currentUsage < 1f && bestUsage < 1f && bestMemory > currentMemory + 0.25f)
+            return best;
+
+        return current.Value;
     }
 
-    private void TryShutdown()
+    private static bool IsMoreActive(DeviceSample candidate, DeviceSample current)
     {
-        try { NvmlShutdown?.Invoke(); } catch { }
+        float candidateUsage = candidate.Usage ?? 0;
+        float currentUsage = current.Usage ?? 0;
+        if (Math.Abs(candidateUsage - currentUsage) > 0.01f)
+            return candidateUsage > currentUsage;
+
+        float candidatePower = candidate.PowerWatts ?? 0;
+        float currentPower = current.PowerWatts ?? 0;
+        if (Math.Abs(candidatePower - currentPower) > 1f)
+            return candidatePower > currentPower;
+
+        float candidateMemory = candidate.VramUsedGb ?? 0;
+        float currentMemory = current.VramUsedGb ?? 0;
+        if (Math.Abs(candidateMemory - currentMemory) > 0.001f)
+            return candidateMemory > currentMemory;
+
+        return candidate.Device.Index < current.Device.Index;
     }
 
-    private static IntPtr TryLoadNvmlLibrary()
+    private void RegisterReadFailure()
     {
-        if (NativeLibrary.TryLoad("nvml.dll", out IntPtr handle))
-            return handle;
-
-        string nvidiaDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-            "NVIDIA Corporation", "NVSMI");
-        string nvmlPath = Path.Combine(nvidiaDir, "nvml.dll");
-
-        if (File.Exists(nvmlPath) && NativeLibrary.TryLoad(nvmlPath, out handle))
-            return handle;
-
-        return IntPtr.Zero;
+        _healthy = false;
+        _consecutiveReadFailures++;
+        if (_consecutiveReadFailures >= MaxConsecutiveReadFailures)
+            ResetSession(scheduleRetry: true);
     }
 
-    private static T? GetExport<T>(string name) where T : Delegate
+    private void ResetSession(bool scheduleRetry)
+    {
+        if (_nvmlInitialized)
+        {
+            try
+            {
+                _nvmlShutdown?.Invoke();
+            }
+            catch
+            {
+            }
+        }
+
+        _nvmlInitialized = false;
+        _sessionReady = false;
+        _healthy = false;
+        _consecutiveReadFailures = 0;
+        _selectedDevicePosition = -1;
+        _devices.Clear();
+
+        if (scheduleRetry)
+            ScheduleRetry();
+    }
+
+    private void ScheduleRetry() => _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+
+    private bool EnsureLibraryLoaded()
+    {
+        if (_libraryHandle != IntPtr.Zero)
+            return true;
+
+        string? path = FindTrustedNvmlPath();
+        const DllImportSearchPath dependencySearchPath =
+            DllImportSearchPath.UseDllDirectoryForDependencies | DllImportSearchPath.System32;
+        if (path == null ||
+            !NativeLibrary.TryLoad(
+                path,
+                typeof(NvidiaGpuMonitor).Assembly,
+                dependencySearchPath,
+                out _libraryHandle))
+        {
+            return false;
+        }
+
+        _nvmlInit = GetExport<NvmlInitFn>("nvmlInit_v2") ?? GetExport<NvmlInitFn>("nvmlInit");
+        _nvmlShutdown = GetExport<NvmlShutdownFn>("nvmlShutdown");
+        _nvmlGetCount = GetExport<NvmlDeviceGetCountFn>("nvmlDeviceGetCount_v2") ??
+                        GetExport<NvmlDeviceGetCountFn>("nvmlDeviceGetCount");
+        _nvmlGetHandle = GetExport<NvmlDeviceGetHandleByIndexFn>("nvmlDeviceGetHandleByIndex_v2") ??
+                         GetExport<NvmlDeviceGetHandleByIndexFn>("nvmlDeviceGetHandleByIndex");
+        _nvmlGetTemperature = GetExport<NvmlDeviceGetTemperatureFn>("nvmlDeviceGetTemperature");
+        _nvmlGetUtilization = GetExport<NvmlDeviceGetUtilizationFn>("nvmlDeviceGetUtilizationRates");
+        _nvmlGetMemoryInfo = GetExport<NvmlDeviceGetMemoryInfoFn>("nvmlDeviceGetMemoryInfo");
+        _nvmlGetPowerUsage = GetExport<NvmlDeviceGetPowerUsageFn>("nvmlDeviceGetPowerUsage");
+        _nvmlGetName = GetExport<NvmlDeviceGetStringFn>("nvmlDeviceGetName");
+        _nvmlGetUuid = GetExport<NvmlDeviceGetStringFn>("nvmlDeviceGetUUID");
+
+        bool hasRequiredExports = _nvmlInit != null && _nvmlShutdown != null &&
+                                  _nvmlGetCount != null && _nvmlGetHandle != null;
+        bool hasTelemetryExport = _nvmlGetTemperature != null || _nvmlGetUtilization != null ||
+                                  _nvmlGetMemoryInfo != null || _nvmlGetPowerUsage != null;
+        if (hasRequiredExports && hasTelemetryExport)
+            return true;
+
+        UnloadLibrary();
+        return false;
+    }
+
+    private T? GetExport<T>(string name) where T : Delegate
+    {
+        if (_libraryHandle == IntPtr.Zero)
+            return null;
+
+        try
+        {
+            if (!NativeLibrary.TryGetExport(_libraryHandle, name, out IntPtr address) || address == IntPtr.Zero)
+                return null;
+
+            return Marshal.GetDelegateForFunctionPointer<T>(address);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void UnloadLibrary()
+    {
+        _nvmlInit = null;
+        _nvmlShutdown = null;
+        _nvmlGetCount = null;
+        _nvmlGetHandle = null;
+        _nvmlGetTemperature = null;
+        _nvmlGetUtilization = null;
+        _nvmlGetMemoryInfo = null;
+        _nvmlGetPowerUsage = null;
+        _nvmlGetName = null;
+        _nvmlGetUuid = null;
+
+        if (_libraryHandle == IntPtr.Zero)
+            return;
+
+        IntPtr handle = _libraryHandle;
+        _libraryHandle = IntPtr.Zero;
+        try
+        {
+            NativeLibrary.Free(handle);
+        }
+        catch
+        {
+        }
+    }
+
+    private static string? TryReadDeviceString(NvmlDeviceGetStringFn? reader, IntPtr device)
+    {
+        if (reader == null)
+            return null;
+
+        IntPtr buffer = Marshal.AllocHGlobal(NvmlStringBufferSize);
+        try
+        {
+            byte[] bytes = new byte[NvmlStringBufferSize];
+            Marshal.Copy(bytes, 0, buffer, bytes.Length);
+            if (reader(device, buffer, NvmlStringBufferSize) != NvmlSuccess)
+                return null;
+
+            Marshal.Copy(buffer, bytes, 0, bytes.Length);
+            int length = Array.IndexOf(bytes, (byte)0);
+            if (length < 0)
+                return null;
+
+            string value = Encoding.UTF8.GetString(bytes, 0, length).Trim();
+            return value.Length > 0 ? value : null;
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static string? FindTrustedNvmlPath()
+    {
+        string systemDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System);
+        string? systemPath = GetTrustedFile(systemDirectory, "nvml.dll");
+        if (systemPath != null)
+            return systemPath;
+
+        string programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        return GetTrustedFile(programFiles, Path.Combine("NVIDIA Corporation", "NVSMI", "nvml.dll"));
+    }
+
+    private static string? GetTrustedFile(string trustedRoot, string relativePath)
     {
         try
         {
-            IntPtr proc = NativeLibrary.GetExport(NvmlLib, name);
-            return proc != IntPtr.Zero ? Marshal.GetDelegateForFunctionPointer<T>(proc) : null;
+            if (string.IsNullOrWhiteSpace(trustedRoot) || !Path.IsPathFullyQualified(trustedRoot))
+                return null;
+
+            string normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(trustedRoot));
+            string candidate = Path.GetFullPath(Path.Combine(normalizedRoot, relativePath));
+            string rootPrefix = normalizedRoot + Path.DirectorySeparatorChar;
+
+            if (!candidate.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(Path.GetFileName(candidate), "nvml.dll", StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(candidate))
+            {
+                return null;
+            }
+
+            FileAttributes attributes = File.GetAttributes(candidate);
+            return (attributes & FileAttributes.ReparsePoint) == 0 ? candidate : null;
         }
         catch
         {

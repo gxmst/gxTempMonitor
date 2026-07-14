@@ -14,13 +14,6 @@
                   StrokeLineJoin="Round"
                   StrokeStartLineCap="Round"
                   StrokeEndLineCap="Round"
-                  Stretch="Fill">
-            <Polyline.Effect>
-                <DropShadowEffect BlurRadius="5"
-                                  ShadowDepth="0"
-                                  Opacity="0.35"
-                                  Color="#8000E5FF"/>
-            </Polyline.Effect>
-        </Polyline>
+                  Stretch="Fill"/>
     </Grid>
 </UserControl>

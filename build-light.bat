@@ -1,25 +1,43 @@
 @echo off
-setlocal
+setlocal EnableExtensions
 cd /d "%~dp0"
 
-echo Publishing light build...
+set "ARCH=%~1"
+if not defined ARCH set "ARCH=x64"
+
+if /I "%ARCH%"=="x64" goto arch_ok
+if /I "%ARCH%"=="arm64" goto arch_ok
+
+echo Unsupported architecture: %ARCH%
+echo Usage: %~nx0 [x64^|arm64]
+exit /b 2
+
+:arch_ok
+set "PROFILE=FrameworkDependent-%ARCH%"
+set "OUTPUT=%CD%\publish\framework-dependent\win-%ARCH%"
+
+if exist "%OUTPUT%\" (
+  echo Removing previous output: %OUTPUT%
+  rmdir /s /q "%OUTPUT%"
+  if exist "%OUTPUT%\" (
+    echo Failed to remove previous output.
+    exit /b 1
+  )
+)
+
+echo Publishing framework-dependent win-%ARCH% build...
 dotnet publish "TempMonitor\TempMonitor.csproj" ^
   -c Release ^
-  -r win-x64 ^
-  --self-contained false ^
-  -p:PublishSingleFile=true ^
-  -p:EnableCompressionInSingleFile=false ^
-  -p:DebugType=none ^
-  -p:DebugSymbols=false ^
-  -o "TempMonitor\bin\Release\net10.0-windows\win-x64\publish"
+  -p:PublishProfile="%PROFILE%" ^
+  --nologo
 
 if errorlevel 1 (
   echo.
-  echo Light build failed.
+  echo Framework-dependent build failed.
   exit /b 1
 )
 
 echo.
-echo Light build output:
-echo F:\监控\gxTempMonitor\TempMonitor\bin\Release\net10.0-windows\win-x64\publish
+echo Framework-dependent build output:
+echo %OUTPUT%
 endlocal
