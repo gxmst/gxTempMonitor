@@ -1,7 +1,7 @@
 <Window x:Class="TempMonitor.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="TempMonitor" Width="205" SizeToContent="Height"
+        Title="gxTempMonitor" Width="229" SizeToContent="Height"
         WindowStyle="None" AllowsTransparency="True" Background="{x:Null}"
         Topmost="True" ShowActivated="False" ShowInTaskbar="False" ResizeMode="NoResize"
         Loaded="Window_Loaded"
@@ -39,7 +39,7 @@
             <Setter Property="FontSize" Value="11.5"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
             <Setter Property="Foreground" Value="{DynamicResource ThemeValueBrush}"/>
-            <Setter Property="Width" Value="60"/>
+            <Setter Property="Width" Value="72"/>
             <Setter Property="Margin" Value="5,0,0,0"/>
             <Setter Property="VerticalAlignment" Value="Center"/>
             <Setter Property="Effect">
@@ -73,6 +73,9 @@
 
     <Window.ContextMenu>
         <ContextMenu x:Name="MainContextMenu">
+            <MenuItem Header="打开 Dashboard" Click="Dashboard_Click"/>
+            <MenuItem Header="设置..." Click="Settings_Click"/>
+            <Separator/>
             <MenuItem x:Name="LockMenuItem" Header="锁定 (鼠标穿透)" Click="Lock_Click"/>
             <Separator/>
             <MenuItem x:Name="StartupMenuItem" Header="开机自启" Click="Startup_Click"/>
@@ -98,11 +101,12 @@
                 <MenuItem x:Name="Delay10MenuItem" Header="10 秒" IsCheckable="True" Click="Delay10_Click"/>
                 <MenuItem x:Name="Delay20MenuItem" Header="20 秒" IsCheckable="True" Click="Delay20_Click"/>
                 <MenuItem x:Name="Delay30MenuItem" Header="30 秒" IsCheckable="True" Click="Delay30_Click"/>
+                <MenuItem x:Name="Delay60MenuItem" Header="60 秒" IsCheckable="True" Click="Delay60_Click"/>
             </MenuItem>
             <MenuItem Header="低干扰选项">
                 <MenuItem x:Name="HotkeyMenuItem" Header="全局热键 Ctrl+Shift+M" IsCheckable="True" Click="Hotkey_Click"/>
-                <MenuItem x:Name="ProcessTrackingMenuItem" Header="进程级 GPU 显存" IsCheckable="True" Click="ProcessTracking_Click"/>
-                <MenuItem x:Name="AlertsMenuItem" Header="告警闪烁" IsCheckable="True" Click="Alerts_Click"/>
+                <MenuItem x:Name="ProcessTrackingMenuItem" Header="进程级 GPU 显存（全部 GPU）" IsCheckable="True" Click="ProcessTracking_Click"/>
+                <MenuItem x:Name="AlertsMenuItem" Header="启用告警" IsCheckable="True" Click="Alerts_Click"/>
                 <MenuItem Header="采样频率">
                     <MenuItem x:Name="Sample1MenuItem" Header="1 秒" IsCheckable="True" Click="Sample1_Click"/>
                     <MenuItem x:Name="Sample2MenuItem" Header="2 秒" IsCheckable="True" Click="Sample2_Click"/>
@@ -120,7 +124,7 @@
 
     <Border x:Name="MainBorder"
             BorderBrush="{DynamicResource ThemeBorderBrush}" BorderThickness="1" CornerRadius="7"
-            Padding="9,5" HorizontalAlignment="Right" Width="135"
+            Padding="9,5" HorizontalAlignment="Right" Width="147"
             MouseEnter="MainBorder_MouseEnter" MouseLeave="MainBorder_MouseLeave">
         <Border.Background>
             <SolidColorBrush x:Name="MainBackgroundBrush" Color="#B014171C"/>
@@ -130,8 +134,8 @@
                 <Grid x:Name="HeaderGrid" Height="11" Opacity="0">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
+                        <ColumnDefinition Width="72"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Grid.Column="2" Text="MAX" Foreground="{DynamicResource ThemeMaxBrush}" FontSize="8" FontWeight="Bold" Margin="10,0,0,0"/>
                 </Grid>
@@ -139,7 +143,7 @@
                 <Grid Margin="0,1" x:Name="CpuRow" Background="Transparent">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
                         <ColumnDefinition x:Name="MaxColWidth" Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <Border x:Name="CpuIndicator" Style="{StaticResource IndicatorStyle}"/>
@@ -153,7 +157,7 @@
                 <Grid Margin="0,1" x:Name="GpuRow">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <Border x:Name="GpuIndicator" Style="{StaticResource IndicatorStyle}"/>
@@ -167,7 +171,7 @@
                 <Grid Margin="0,1" x:Name="RamRow">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <Border x:Name="RamIndicator" Style="{StaticResource IndicatorStyle}"/>
@@ -181,7 +185,7 @@
                 <Grid Margin="0,1" x:Name="VramRow">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="VRAM" Style="{StaticResource LabelStyle}"/>
@@ -194,7 +198,7 @@
                 <Grid Margin="0,1" x:Name="NetUpRow">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
                     <TextBlock Text="UP ↑" Style="{StaticResource LabelStyle}"/>
@@ -207,10 +211,10 @@
                 <Grid Margin="0,1" x:Name="NetDownRow">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="35"/>
-                        <ColumnDefinition Width="60"/>
+                        <ColumnDefinition Width="72"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
-                    <TextBlock Text="DW ↓" Style="{StaticResource LabelStyle}"/>
+                    <TextBlock Text="DN ↓" Style="{StaticResource LabelStyle}"/>
                     <TextBlock x:Name="NetDownText" Grid.Column="1" Text="0.0K" Style="{StaticResource ValueStyle}" Foreground="{DynamicResource ThemeNetDownBrush}" FontSize="10"/>
                     <Border Grid.Column="2" Width="{Binding ElementName=MaxContainer, Path=Width}" ClipToBounds="True">
                         <TextBlock x:Name="NetDownMaxText" Text="0.0K" Style="{StaticResource MaxStyle}" FontSize="10"/>

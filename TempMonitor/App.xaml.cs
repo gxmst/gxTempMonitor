@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
+using System.Security;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -60,6 +61,11 @@ public partial class App : System.Windows.Application
             HardwareMonitorService.Instance.Configure(
                 config.SamplingIntervalSeconds,
                 config.TrackTopGpuProcess);
+            HardwareMonitorService.Instance.ConfigureSelections(
+                config.PreferredGpuProvider,
+                config.PreferredGpuDeviceIdentifier,
+                config.NetworkSelectionMode,
+                config.PreferredNetworkInterfaceId);
 
             MainWindow = new MainWindow(config);
             MainWindow.Show();
@@ -114,6 +120,9 @@ public partial class App : System.Windows.Application
         {
         }
         catch (UnauthorizedAccessException)
+        {
+        }
+        catch (SecurityException)
         {
         }
     }

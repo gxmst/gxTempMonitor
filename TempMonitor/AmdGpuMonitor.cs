@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -15,7 +16,7 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
     private const int MaxConsecutiveReadFailures = 3;
     private const int AdlPowerTypeTotal = 0;
     private const long MaxPlausibleVramBytes = 1L << 50;
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+    private static readonly long RetryDelayStopwatchTicks = checked(5L * Stopwatch.Frequency);
     private static readonly AdlMemoryAllocFn MemoryAllocCallback = AllocateAdlMemory;
 
     private readonly object _syncRoot = new();
@@ -36,8 +37,9 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
     private Adl2Overdrive6CurrentPowerGetFn? _adlGetCurrentPower;
 
     private int _selectedDevicePosition = -1;
+    private string? _preferredDeviceIdentifier;
     private int _consecutiveReadFailures;
-    private DateTime _nextRetryUtc = DateTime.MinValue;
+    private long _nextRetryTimestamp;
     private bool _sessionReady;
     private bool _accepted;
     private bool _healthy;
@@ -236,6 +238,51 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
 
     public string VendorName => "AMD";
 
+    public IReadOnlyList<GpuDeviceInfo> AvailableDevices
+    {
+        get
+        {
+            lock (_syncRoot)
+            {
+                var devices = new GpuDeviceInfo[_devices.Count];
+                for (int index = 0; index < _devices.Count; index++)
+                {
+                    DeviceState device = _devices[index];
+                    devices[index] = new GpuDeviceInfo(VendorName, device.Identifier, device.Name);
+                }
+
+                return devices;
+            }
+        }
+    }
+
+    public void SetPreferredDevice(string? deviceIdentifier)
+    {
+        lock (_syncRoot)
+        {
+            string? normalized = string.IsNullOrWhiteSpace(deviceIdentifier)
+                ? null
+                : deviceIdentifier;
+            if (string.Equals(_preferredDeviceIdentifier, normalized, StringComparison.Ordinal))
+                return;
+
+            _preferredDeviceIdentifier = normalized;
+            _selectedDevicePosition = -1;
+        }
+    }
+
+    public void RequestDeviceRefresh()
+    {
+        lock (_syncRoot)
+        {
+            if (_disposed)
+                return;
+
+            ResetSession(scheduleRetry: false);
+            _nextRetryTimestamp = 0;
+        }
+    }
+
     public bool TryInitialize()
     {
         lock (_syncRoot)
@@ -259,7 +306,7 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
 
             if (!_sessionReady)
             {
-                if (DateTime.UtcNow < _nextRetryUtc || !TryInitializeSession())
+                if (Stopwatch.GetTimestamp() < _nextRetryTimestamp || !TryInitializeSession())
                     return GpuReading.Empty;
             }
 
@@ -322,7 +369,7 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
 
     private bool TryInitializeSession()
     {
-        if (DateTime.UtcNow < _nextRetryUtc)
+        if (Stopwatch.GetTimestamp() < _nextRetryTimestamp)
             return false;
 
         try
@@ -461,7 +508,7 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
 
             _selectedDevicePosition = -1;
             _consecutiveReadFailures = 0;
-            _nextRetryUtc = DateTime.MinValue;
+            _nextRetryTimestamp = 0;
             _sessionReady = true;
             _accepted = true;
             _healthy = true;
@@ -550,6 +597,20 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
 
     private DeviceSample SelectDevice(List<DeviceSample> samples)
     {
+        if (!string.IsNullOrWhiteSpace(_preferredDeviceIdentifier))
+        {
+            foreach (DeviceSample sample in samples)
+            {
+                if (string.Equals(
+                        sample.Device.Identifier,
+                        _preferredDeviceIdentifier,
+                        StringComparison.Ordinal))
+                {
+                    return sample;
+                }
+            }
+        }
+
         DeviceSample best = samples[0];
         for (int i = 1; i < samples.Count; i++)
         {
@@ -641,7 +702,8 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
             ScheduleRetry();
     }
 
-    private void ScheduleRetry() => _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+    private void ScheduleRetry() =>
+        _nextRetryTimestamp = Stopwatch.GetTimestamp() + RetryDelayStopwatchTicks;
 
     private bool EnsureLibraryLoaded()
     {

@@ -56,6 +56,7 @@ if ([string]::IsNullOrWhiteSpace($ComponentPath)) {
     [System.IO.Directory]::CreateDirectory($temporaryComponentRoot) | Out-Null
 
     & dotnet restore $projectPath `
+        --locked-mode `
         -p:PublishProfile=$publishProfile `
         "-p:BaseIntermediateOutputPath=$temporaryComponentRoot\" `
         -p:NuGetAudit=true `

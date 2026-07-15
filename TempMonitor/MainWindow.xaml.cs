@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security;
 using System.Text;
 using System.Threading;
 using System.Windows;
@@ -138,15 +139,19 @@ public partial class MainWindow : Window
     private const uint ModShift = 0x0004;
     private const uint ModNoRepeat = 0x4000;
     private const uint VkM = 0x4D;
-    private const double BaseWidth = 135;
-    private const double FullWidth = 205;
+    private const double BaseWidth = 147;
+    private const double FullWidth = 229;
     private const double AnimDurationMs = 200;
-    private const double MaxContainerWidth = 60;
+    private const double MaxContainerWidth = 72;
 
-    private readonly AppConfig _config;
+    private AppConfig _config;
+    private readonly AlertEngine _alertEngine = new();
     private DispatcherTimer? _idleTimer;
+    private DispatcherTimer? _environmentTimer;
     private HwndSource? _windowSource;
     private System.Windows.Forms.NotifyIcon? _notifyIcon;
+    private System.Windows.Forms.ContextMenuStrip? _trayContextMenu;
+    private System.Drawing.Icon? _applicationIcon;
     private System.Windows.Forms.ToolStripMenuItem? _trayLockMenuItem;
     private System.Windows.Forms.ToolStripMenuItem? _trayStartupMenuItem;
     private System.Windows.Forms.ToolStripMenuItem? _trayShowRamMenuItem;
@@ -163,10 +168,14 @@ public partial class MainWindow : Window
     private System.Windows.Forms.ToolStripMenuItem? _traySample2MenuItem;
     private System.Windows.Forms.ToolStripMenuItem? _traySample5MenuItem;
     private DashboardWindow? _dashboardWindow;
+    private SettingsWindow? _settingsWindow;
+    private WelcomeWindow? _welcomeWindow;
     private HardwareSnapshot? _pendingSnapshot;
     private int _snapshotDispatchScheduled;
 
     private bool _isLocked;
+    private bool _showCpu = true;
+    private bool _showGpu = true;
     private bool _showRam = true;
     private bool _showVram = true;
     private bool _showUpload = true;
@@ -177,9 +186,20 @@ public partial class MainWindow : Window
     private bool _hotkeyRegistered;
     private bool _trackTopGpuProcess;
     private bool _enableAlerts = true;
+    private bool _alwaysOnTop = true;
+    private bool _enableAdaptiveSampling = true;
+    private bool _hiddenForFullscreen;
+    private bool _dimmedForFullscreen;
     private volatile bool _isExiting;
+    private bool _futureConfigWarningShown;
+    private bool _configSaveWarningShown;
     private bool _systemEventsSubscribed;
     private WidgetTheme _currentTheme = WidgetTheme.Dark;
+    private GpuDisplayMetric _gpuDisplayMetric = GpuDisplayMetric.Auto;
+    private MemoryDisplayMode _ramDisplayMode = MemoryDisplayMode.Used;
+    private MemoryDisplayMode _vramDisplayMode = MemoryDisplayMode.Used;
+    private NetworkDisplayUnit _networkDisplayUnit = NetworkDisplayUnit.Auto;
+    private FullscreenBehavior _fullscreenBehavior = FullscreenBehavior.StayVisible;
     private double _widgetOpacity = 0.78;
     private int _delayedStartSeconds;
     private int _samplingIntervalSeconds = 1;
@@ -197,24 +217,47 @@ public partial class MainWindow : Window
         ApplyVisibilitySettings();
         HardwareMonitorService.Instance.DataUpdated += OnHardwareDataUpdated;
         HardwareMonitorService.Instance.Configure(_samplingIntervalSeconds, _trackTopGpuProcess);
+        HardwareMonitorService.Instance.ConfigureSelections(
+            _config.PreferredGpuProvider,
+            _config.PreferredGpuDeviceIdentifier,
+            _config.NetworkSelectionMode,
+            _config.PreferredNetworkInterfaceId);
         ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
 
         _idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
         _idleTimer.Tick += IdleTimer_Tick;
         _idleTimer.Start();
+
+        _environmentTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+        _environmentTimer.Tick += EnvironmentTimer_Tick;
+        UpdateEnvironmentMonitoring();
     }
 
     private void InitializeTrayIcon()
     {
+        try
+        {
+            string? executablePath = Environment.ProcessPath;
+            if (!string.IsNullOrWhiteSpace(executablePath) && File.Exists(executablePath))
+                _applicationIcon = System.Drawing.Icon.ExtractAssociatedIcon(executablePath);
+        }
+        catch (Exception ex) when (ex is ExternalException or ArgumentException)
+        {
+            Debug.WriteLine($"无法读取应用图标: {ex.Message}");
+        }
+
         _notifyIcon = new System.Windows.Forms.NotifyIcon
         {
             Text = "gxTempMonitor",
-            Icon = System.Drawing.SystemIcons.Application,
+            Icon = _applicationIcon ?? System.Drawing.SystemIcons.Application,
             Visible = true
         };
         _notifyIcon.DoubleClick += (_, _) => ToggleVisibility();
 
         var contextMenu = new System.Windows.Forms.ContextMenuStrip();
+        _trayContextMenu = contextMenu;
+        var settingsMenuItem = new System.Windows.Forms.ToolStripMenuItem("设置...", null, (_, _) => OpenSettings());
+        var dashboardMenuItem = new System.Windows.Forms.ToolStripMenuItem("打开 Dashboard", null, (_, _) => ShowDashboard());
         _trayLockMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u9501\u5B9A (\u9F20\u6807\u7A7F\u900F)", null, (_, _) => SetLock(!_isLocked));
         _trayStartupMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u5F00\u673A\u81EA\u542F", null, (_, _) => ToggleStartup());
         _trayShowRamMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u663E\u793A\u5185\u5B58 (RAM)", null, (_, _) => SetMetricVisibility(MetricVisibility.Ram, !_showRam));
@@ -225,8 +268,8 @@ public partial class MainWindow : Window
         _trayLightThemeMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u6D45\u8272\u4E3B\u9898", null, (_, _) => SetTheme(WidgetTheme.Light));
         _trayExportCsvMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u5BFC\u51FA CSV", null, (_, _) => ExportCsv());
         _trayHotkeyMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u5168\u5C40\u70ED\u952E Ctrl+Shift+M", null, (_, _) => SetGlobalHotkeyEnabled(!_enableGlobalHotkey));
-        _trayProcessTrackingMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u8FDB\u7A0B\u7EA7 GPU \u663E\u5B58", null, (_, _) => SetProcessTrackingEnabled(!_trackTopGpuProcess));
-        _trayAlertsMenuItem = new System.Windows.Forms.ToolStripMenuItem("\u544A\u8B66\u95EA\u70C1", null, (_, _) => SetAlertsEnabled(!_enableAlerts));
+        _trayProcessTrackingMenuItem = new System.Windows.Forms.ToolStripMenuItem("进程级 GPU 显存（全部 GPU）", null, (_, _) => SetProcessTrackingEnabled(!_trackTopGpuProcess));
+        _trayAlertsMenuItem = new System.Windows.Forms.ToolStripMenuItem("启用告警", null, (_, _) => SetAlertsEnabled(!_enableAlerts));
         _traySample1MenuItem = new System.Windows.Forms.ToolStripMenuItem("1 \u79D2", null, (_, _) => SetSamplingInterval(1));
         _traySample2MenuItem = new System.Windows.Forms.ToolStripMenuItem("2 \u79D2", null, (_, _) => SetSamplingInterval(2));
         _traySample5MenuItem = new System.Windows.Forms.ToolStripMenuItem("5 \u79D2", null, (_, _) => SetSamplingInterval(5));
@@ -252,17 +295,13 @@ public partial class MainWindow : Window
         lowImpactMenu.DropDownItems.Add(_trayAlertsMenuItem);
         lowImpactMenu.DropDownItems.Add(samplingMenu);
 
+        contextMenu.Items.Add(dashboardMenuItem);
+        contextMenu.Items.Add(settingsMenuItem);
         contextMenu.Items.Add(_trayLockMenuItem);
         contextMenu.Items.Add("-");
         contextMenu.Items.Add(_trayStartupMenuItem);
-        contextMenu.Items.Add("-");
-        contextMenu.Items.Add(visibilityMenu);
-        contextMenu.Items.Add(themeMenu);
-        contextMenu.Items.Add(lowImpactMenu);
         contextMenu.Items.Add(_trayExportCsvMenuItem);
-        contextMenu.Items.Add("\u6062\u590D\u9ED8\u8BA4\u72B6\u6001", null, (_, _) => RestoreDefaultState());
         contextMenu.Items.Add("-");
-        contextMenu.Items.Add("\u91CD\u7F6E\u6700\u5927\u503C", null, (_, _) => ResetMaxValues());
         contextMenu.Items.Add("\u9000\u51FA (Exit)", null, (_, _) => ExitApplication());
         _notifyIcon.ContextMenuStrip = contextMenu;
 
@@ -315,8 +354,14 @@ public partial class MainWindow : Window
         {
             CpuUsageText.Text = $"{snapshot.CpuUsage:0.0} %";
             CpuMaxText.Text = $"{snapshot.CpuUsageMax:0.0} %";
-            CpuUsageText.Foreground = UiHelper.GetAlertBrush(snapshot.CpuUsage);
-            UpdateIndicator(CpuIndicator, snapshot.CpuUsage);
+            CpuUsageText.Foreground = GetConfiguredAlertBrush(
+                snapshot.CpuUsage,
+                _config.CpuUsageAlertThreshold);
+            UpdateIndicator(
+                CpuIndicator,
+                snapshot.CpuUsage,
+                _config.EnableAlerts ? _config.CpuUsageAlertThreshold - _config.AlertHysteresis : float.PositiveInfinity,
+                _config.EnableAlerts ? _config.CpuUsageAlertThreshold : float.PositiveInfinity);
         }
         else
         {
@@ -326,27 +371,75 @@ public partial class MainWindow : Window
             UpdateIndicator(CpuIndicator, 0);
         }
 
-        if (snapshot.GpuTemperature.HasValue)
+        GpuDisplayMetric effectiveGpuMetric = ResolveGpuDisplayMetric(snapshot);
+        switch (effectiveGpuMetric)
         {
-            GpuTempText.Text = $"{snapshot.GpuTemperature.Value:0.0} \u00B0C";
-            GpuMaxText.Text = $"{(snapshot.GpuTemperatureMax ?? snapshot.GpuTemperature.Value):0.0} \u00B0C";
-            GpuTempText.Foreground = UiHelper.GetAlertBrush(snapshot.GpuTemperature.Value);
-            UpdateIndicator(GpuIndicator, snapshot.GpuTemperature.Value);
-        }
-        else
-        {
-            GpuTempText.Text = "-- \u00B0C";
-            GpuMaxText.Text = "-- \u00B0C";
-            GpuTempText.Foreground = UiHelper.NormalBrush;
-            UpdateIndicator(GpuIndicator, 0);
+            case GpuDisplayMetric.Temperature when snapshot.GpuTemperature.HasValue:
+                GpuTempText.Text = $"{snapshot.GpuTemperature.Value:0.0} \u00B0C";
+                GpuMaxText.Text = $"{(snapshot.GpuTemperatureMax ?? snapshot.GpuTemperature.Value):0.0} \u00B0C";
+                GpuTempText.Foreground = GetConfiguredAlertBrush(
+                    snapshot.GpuTemperature.Value,
+                    _config.GpuTemperatureAlertThreshold);
+                UpdateIndicator(
+                    GpuIndicator,
+                    snapshot.GpuTemperature.Value,
+                    _config.EnableAlerts ? _config.GpuTemperatureAlertThreshold - _config.AlertHysteresis : float.PositiveInfinity,
+                    _config.EnableAlerts ? _config.GpuTemperatureAlertThreshold : float.PositiveInfinity);
+                break;
+            case GpuDisplayMetric.Usage when snapshot.HasGpuUsage:
+                GpuTempText.Text = $"{snapshot.GpuUsagePercent:0.0} %";
+                GpuMaxText.Text = $"{(snapshot.GpuUsageMaxPercent ?? snapshot.GpuUsagePercent):0.0} %";
+                GpuTempText.Foreground = _config.EnableAlerts
+                    ? UiHelper.GetAlertBrush(snapshot.GpuUsagePercent)
+                    : UiHelper.NormalBrush;
+                UpdateIndicator(
+                    GpuIndicator,
+                    snapshot.GpuUsagePercent,
+                    _config.EnableAlerts ? 80 : float.PositiveInfinity,
+                    _config.EnableAlerts ? 90 : float.PositiveInfinity);
+                break;
+            case GpuDisplayMetric.Power when snapshot.GpuPowerWatts.HasValue:
+                GpuTempText.Text = $"{snapshot.GpuPowerWatts.Value:0.0} W";
+                GpuMaxText.Text = $"{(snapshot.GpuPowerMaxWatts ?? snapshot.GpuPowerWatts.Value):0.0} W";
+                GpuTempText.Foreground = UiHelper.NormalBrush;
+                UpdateIndicator(GpuIndicator, 0);
+                break;
+            default:
+                GpuTempText.Text = effectiveGpuMetric switch
+                {
+                    GpuDisplayMetric.Usage => "-- %",
+                    GpuDisplayMetric.Power => "-- W",
+                    _ => "-- \u00B0C"
+                };
+                GpuMaxText.Text = GpuTempText.Text;
+                GpuTempText.Foreground = UiHelper.NormalBrush;
+                UpdateIndicator(GpuIndicator, 0);
+                break;
         }
 
         if (snapshot.HasRamData)
         {
-            RamUsedText.Text = $"{snapshot.RamUsedGb:F1} GB";
-            RamMaxText.Text = $"{snapshot.RamUsedMaxGb:F1} GB";
-            RamUsedText.Foreground = UiHelper.GetAlertBrush(snapshot.RamUsagePercent);
-            UpdateIndicator(RamIndicator, snapshot.RamUsagePercent);
+            if (_ramDisplayMode == MemoryDisplayMode.Percentage)
+            {
+                RamUsedText.Text = $"{snapshot.RamUsagePercent:0.0} %";
+                float maximumPercent = snapshot.TotalRamGb > 0
+                    ? Math.Clamp(snapshot.RamUsedMaxGb / snapshot.TotalRamGb * 100, 0, 100)
+                    : snapshot.RamUsagePercent;
+                RamMaxText.Text = $"{maximumPercent:0.0} %";
+            }
+            else
+            {
+                RamUsedText.Text = $"{snapshot.RamUsedGb:F1} GB";
+                RamMaxText.Text = $"{snapshot.RamUsedMaxGb:F1} GB";
+            }
+            RamUsedText.Foreground = GetConfiguredAlertBrush(
+                snapshot.RamUsagePercent,
+                _config.RamUsageAlertThreshold);
+            UpdateIndicator(
+                RamIndicator,
+                snapshot.RamUsagePercent,
+                _config.EnableAlerts ? _config.RamUsageAlertThreshold - _config.AlertHysteresis : float.PositiveInfinity,
+                _config.EnableAlerts ? _config.RamUsageAlertThreshold : float.PositiveInfinity);
         }
         else
         {
@@ -356,13 +449,26 @@ public partial class MainWindow : Window
             UpdateIndicator(RamIndicator, 0);
         }
 
-        VramUsedText.Text = UiHelper.FormatOptionalGb(snapshot.VramUsedGb);
-        VramMaxText.Text = UiHelper.FormatOptionalGb(snapshot.VramUsedMaxGb);
+        if (_vramDisplayMode == MemoryDisplayMode.Percentage &&
+            snapshot.VramUsedGb.HasValue && snapshot.VramTotalGb is > 0)
+        {
+            float vramPercent = Math.Clamp(snapshot.VramUsedGb.Value / snapshot.VramTotalGb.Value * 100, 0, 100);
+            VramUsedText.Text = $"{vramPercent:0.0} %";
+            float vramMaximumPercent = snapshot.VramUsedMaxGb.HasValue
+                ? Math.Clamp(snapshot.VramUsedMaxGb.Value / snapshot.VramTotalGb.Value * 100, 0, 100)
+                : vramPercent;
+            VramMaxText.Text = $"{vramMaximumPercent:0.0} %";
+        }
+        else
+        {
+            VramUsedText.Text = UiHelper.FormatOptionalGb(snapshot.VramUsedGb);
+            VramMaxText.Text = UiHelper.FormatOptionalGb(snapshot.VramUsedMaxGb);
+        }
 
-        NetUpText.Text = snapshot.HasNetworkData ? UiHelper.FormatSpeed(snapshot.NetUploadBytesPerSecond) : "--";
-        NetUpMaxText.Text = UiHelper.FormatSpeed(snapshot.NetUploadMaxBytesPerSecond);
-        NetDownText.Text = snapshot.HasNetworkData ? UiHelper.FormatSpeed(snapshot.NetDownloadBytesPerSecond) : "--";
-        NetDownMaxText.Text = UiHelper.FormatSpeed(snapshot.NetDownloadMaxBytesPerSecond);
+        NetUpText.Text = snapshot.HasNetworkData ? FormatNetworkSpeed(snapshot.NetUploadBytesPerSecond) : "--";
+        NetUpMaxText.Text = FormatNetworkSpeed(snapshot.NetUploadMaxBytesPerSecond);
+        NetDownText.Text = snapshot.HasNetworkData ? FormatNetworkSpeed(snapshot.NetDownloadBytesPerSecond) : "--";
+        NetDownMaxText.Text = FormatNetworkSpeed(snapshot.NetDownloadMaxBytesPerSecond);
 
         CheckAlerts(snapshot);
         UpdateTrayTooltip(snapshot);
@@ -372,7 +478,16 @@ public partial class MainWindow : Window
     {
         if (_notifyIcon == null) return;
 
-        var gpuTemp = snapshot.GpuTemperature.HasValue ? $"{snapshot.GpuTemperature.Value:0.0}\u00B0C" : "--";
+        string gpuValue = ResolveGpuDisplayMetric(snapshot) switch
+        {
+            GpuDisplayMetric.Temperature when snapshot.GpuTemperature.HasValue =>
+                $"{snapshot.GpuTemperature.Value:0.0}\u00B0C",
+            GpuDisplayMetric.Usage when snapshot.HasGpuUsage =>
+                $"{snapshot.GpuUsagePercent:0.0}%",
+            GpuDisplayMetric.Power when snapshot.GpuPowerWatts.HasValue =>
+                $"{snapshot.GpuPowerWatts.Value:0.0}W",
+            _ => "--"
+        };
         var topProcess = snapshot.TopGpuProcess;
         var processLine = topProcess != null ? $"\nGPU\u8FDB\u7A0B: {topProcess}" : "";
 
@@ -380,7 +495,7 @@ public partial class MainWindow : Window
         string ramText = snapshot.HasRamData
             ? $"{snapshot.RamUsedGb:F1}GB ({snapshot.RamUsagePercent:0.0}%)"
             : "--";
-        var text = $"CPU {cpuText} | GPU {gpuTemp}\n" +
+        var text = $"CPU {cpuText} | GPU {gpuValue}\n" +
                    $"RAM {ramText}" +
                    $"{processLine}";
 
@@ -392,35 +507,62 @@ public partial class MainWindow : Window
 
     private void CheckAlerts(HardwareSnapshot snapshot)
     {
-        if (!_enableAlerts)
-        {
-            if (_isFlashing)
-            {
-                _isFlashing = false;
-                StopFlashAnimation();
-            }
-
-            return;
-        }
-
-        bool alert = false;
-
-        if (snapshot.GpuTemperature.HasValue && snapshot.GpuTemperature.Value >= 85)
-            alert = true;
-
-        if (snapshot.HasRamData && snapshot.RamUsagePercent >= 90)
-            alert = true;
-
-        if (alert && !_isFlashing)
+        AlertEvaluation evaluation = _alertEngine.Evaluate(snapshot, _config, Stopwatch.GetTimestamp());
+        bool shouldFlash = evaluation.IsActive && _config.AlertPresentation == AlertPresentation.Flash;
+        if (shouldFlash && !_isFlashing)
         {
             _isFlashing = true;
             StartFlashAnimation();
         }
-        else if (!alert && _isFlashing)
+        else if (!shouldFlash && _isFlashing)
         {
             _isFlashing = false;
             StopFlashAnimation();
         }
+
+        if (evaluation.BecameActive && evaluation.ShouldNotify &&
+            _config.AlertPresentation == AlertPresentation.TrayNotification &&
+            _notifyIcon != null)
+        {
+            _notifyIcon.ShowBalloonTip(
+                5000,
+                "gxTempMonitor 告警",
+                evaluation.Message,
+                System.Windows.Forms.ToolTipIcon.Warning);
+        }
+    }
+
+    private GpuDisplayMetric ResolveGpuDisplayMetric(HardwareSnapshot snapshot)
+    {
+        if (_gpuDisplayMetric != GpuDisplayMetric.Auto)
+            return _gpuDisplayMetric;
+
+        return snapshot.GpuPrimaryMetric switch
+        {
+            GpuPrimaryMetric.Temperature => GpuDisplayMetric.Temperature,
+            GpuPrimaryMetric.Usage => GpuDisplayMetric.Usage,
+            GpuPrimaryMetric.Power => GpuDisplayMetric.Power,
+            _ => GpuDisplayMetric.Usage
+        };
+    }
+
+    private string FormatNetworkSpeed(float bytesPerSecond)
+    {
+        if (_networkDisplayUnit == NetworkDisplayUnit.Auto)
+            return UiHelper.FormatSpeed(bytesPerSecond);
+
+        if (_networkDisplayUnit == NetworkDisplayUnit.BytesPerSecond)
+        {
+            float normalized = Math.Max(0, bytesPerSecond);
+            return normalized >= 1024 * 1024
+                ? $"{normalized / 1024 / 1024:0.0}MiB/s"
+                : $"{normalized / 1024:0.0}KiB/s";
+        }
+
+        float bitsPerSecond = Math.Max(0, bytesPerSecond) * 8;
+        return bitsPerSecond >= 1_000_000
+            ? $"{bitsPerSecond / 1_000_000:0.0}Mbps"
+            : $"{bitsPerSecond / 1_000:0.0}Kbps";
     }
 
     private void StartFlashAnimation()
@@ -509,6 +651,7 @@ public partial class MainWindow : Window
         Delay10MenuItem.IsChecked = _delayedStartSeconds == 10;
         Delay20MenuItem.IsChecked = _delayedStartSeconds == 20;
         Delay30MenuItem.IsChecked = _delayedStartSeconds == 30;
+        Delay60MenuItem.IsChecked = _delayedStartSeconds == 60;
     }
 
     private void SetLock(bool lockIt)
@@ -540,7 +683,7 @@ public partial class MainWindow : Window
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        Topmost = true;
+        Topmost = _alwaysOnTop;
         EnsureWindowIsVisible();
         if (_isDockedRight)
             FixedToRight();
@@ -557,6 +700,62 @@ public partial class MainWindow : Window
         _windowSource?.AddHook(WndProc);
         UpdateHotkeyRegistration();
         SubscribeToDisplayChanges();
+
+        if (_config.IsReadOnlyDueToUnsupportedConfig)
+            _ = Dispatcher.InvokeAsync(ShowFutureConfigWarningIfNeeded, DispatcherPriority.ApplicationIdle);
+
+        if (!_config.HasCompletedOnboarding)
+            _ = Dispatcher.InvokeAsync(ShowWelcome, DispatcherPriority.ApplicationIdle);
+    }
+
+    private void ShowFutureConfigWarningIfNeeded()
+    {
+        if (_futureConfigWarningShown || !_config.IsReadOnlyDueToUnsupportedConfig || _isExiting)
+            return;
+
+        _futureConfigWarningShown = true;
+        System.Windows.MessageBox.Show(
+            this,
+            "检测到的配置来自更高版本、文件过大、损坏或暂时无法读取。为防止丢失数据，本版本不会保存或覆盖该配置。\n\n如需重置，请先备份或移走 %LocalAppData%\\gxTempMonitor\\config.json，然后重启程序。",
+            "配置为只读",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
+    private void ShowWelcome()
+    {
+        if (_isExiting || _welcomeWindow != null || _config.HasCompletedOnboarding)
+            return;
+
+        _welcomeWindow = new WelcomeWindow { Owner = this };
+        _welcomeWindow.SettingsRequested += WelcomeWindow_SettingsRequested;
+        _welcomeWindow.Closed += WelcomeWindow_Closed;
+        _welcomeWindow.Show();
+        _welcomeWindow.Activate();
+    }
+
+    private void WelcomeWindow_SettingsRequested()
+    {
+        CompleteOnboarding();
+        _ = Dispatcher.InvokeAsync(OpenSettings, DispatcherPriority.ApplicationIdle);
+    }
+
+    private void WelcomeWindow_Closed(object? sender, EventArgs e) => CompleteOnboarding();
+
+    private void CompleteOnboarding()
+    {
+        if (_welcomeWindow != null)
+        {
+            _welcomeWindow.SettingsRequested -= WelcomeWindow_SettingsRequested;
+            _welcomeWindow.Closed -= WelcomeWindow_Closed;
+            _welcomeWindow = null;
+        }
+
+        if (!_config.HasCompletedOnboarding)
+        {
+            _config.HasCompletedOnboarding = true;
+            SaveConfig();
+        }
     }
 
     private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -574,13 +773,187 @@ public partial class MainWindow : Window
     {
         if (Visibility == Visibility.Visible)
         {
+            _hiddenForFullscreen = false;
             Hide();
         }
         else
         {
+            _hiddenForFullscreen = false;
             Show();
-            Topmost = true;
+            Topmost = _alwaysOnTop;
         }
+
+        ApplyEffectiveSamplingInterval();
+    }
+
+    private void OpenSettings()
+    {
+        ShowFutureConfigWarningIfNeeded();
+
+        if (_settingsWindow != null)
+        {
+            if (_settingsWindow.WindowState == WindowState.Minimized)
+                _settingsWindow.WindowState = WindowState.Normal;
+            _settingsWindow.Activate();
+            return;
+        }
+
+        if (_welcomeWindow != null)
+        {
+            WelcomeWindow welcomeWindow = _welcomeWindow;
+            CompleteOnboarding();
+            welcomeWindow.Close();
+        }
+
+        var settingsWindow = new SettingsWindow(_config, HardwareMonitorService.Instance)
+        {
+            Owner = this
+        };
+        _settingsWindow = settingsWindow;
+        settingsWindow.SettingsApplied += SettingsWindow_SettingsApplied;
+        if (_trayContextMenu != null)
+            _trayContextMenu.Enabled = false;
+
+        try
+        {
+            settingsWindow.ShowDialog();
+        }
+        finally
+        {
+            settingsWindow.SettingsApplied -= SettingsWindow_SettingsApplied;
+            if (ReferenceEquals(_settingsWindow, settingsWindow))
+                _settingsWindow = null;
+            if (!_isExiting && _trayContextMenu != null)
+                _trayContextMenu.Enabled = true;
+        }
+    }
+
+    private void SettingsWindow_SettingsApplied(AppConfig updatedConfig)
+    {
+        if (_config.IsReadOnlyDueToUnsupportedConfig)
+            updatedConfig.IsReadOnlyDueToUnsupportedConfig = true;
+        updatedConfig.Top = Top;
+        updatedConfig.Left = Left;
+        updatedConfig.IsDockedRight = _isDockedRight;
+        updatedConfig.IsLocked = _isLocked;
+        _config = updatedConfig;
+        ApplyConfig(_config);
+        ApplyRuntimeConfiguration();
+        SaveConfig();
+
+        if (IsStartupEnabled())
+            CreateOrUpdateStartupShortcut(showError: false);
+    }
+
+    private void ApplyRuntimeConfiguration()
+    {
+        Topmost = _alwaysOnTop;
+        ApplyVisibilitySettings();
+        ApplyTheme();
+        UpdateOpacityMenuItems();
+        UpdateDelayMenuItems();
+        UpdateHotkeyRegistration();
+        UpdateRuntimeOptionMenuItems();
+        UpdateEnvironmentMonitoring();
+        _alertEngine.Reset();
+
+        HardwareMonitorService.Instance.Configure(
+            _samplingIntervalSeconds,
+            _trackTopGpuProcess);
+        HardwareMonitorService.Instance.ConfigureSelections(
+            _config.PreferredGpuProvider,
+            _config.PreferredGpuDeviceIdentifier,
+            _config.NetworkSelectionMode,
+            _config.PreferredNetworkInterfaceId);
+        _dashboardWindow?.ApplyConfiguration(_config);
+        ApplyEffectiveSamplingInterval();
+        ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
+    }
+
+    private void EnvironmentTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!ShouldMonitorFullscreen(_fullscreenBehavior))
+        {
+            UpdateEnvironmentMonitoring();
+            return;
+        }
+
+        IntPtr mainHandle = new WindowInteropHelper(this).Handle;
+        IntPtr dashboardHandle = _dashboardWindow == null
+            ? IntPtr.Zero
+            : new WindowInteropHelper(_dashboardWindow).Handle;
+        IntPtr settingsHandle = _settingsWindow == null
+            ? IntPtr.Zero
+            : new WindowInteropHelper(_settingsWindow).Handle;
+        bool fullscreen = FullscreenDetector.IsForegroundFullscreen(
+            mainHandle,
+            dashboardHandle,
+            settingsHandle);
+
+        ApplyFullscreenBehavior(fullscreen);
+    }
+
+    internal static bool ShouldMonitorFullscreen(FullscreenBehavior behavior) =>
+        behavior is FullscreenBehavior.Hide or FullscreenBehavior.Dim;
+
+    private void UpdateEnvironmentMonitoring()
+    {
+        if (_environmentTimer == null)
+            return;
+
+        if (ShouldMonitorFullscreen(_fullscreenBehavior))
+        {
+            if (!_environmentTimer.IsEnabled)
+                _environmentTimer.Start();
+            return;
+        }
+
+        _environmentTimer.Stop();
+        if (_hiddenForFullscreen || _dimmedForFullscreen)
+            ApplyFullscreenBehavior(fullscreen: false);
+    }
+
+    private void ApplyFullscreenBehavior(bool fullscreen)
+    {
+        if (_fullscreenBehavior == FullscreenBehavior.Hide)
+        {
+            if (fullscreen && Visibility == Visibility.Visible && !_hiddenForFullscreen)
+            {
+                _hiddenForFullscreen = true;
+                Hide();
+            }
+            else if (!fullscreen && _hiddenForFullscreen)
+            {
+                _hiddenForFullscreen = false;
+                Show();
+                Topmost = _alwaysOnTop;
+            }
+        }
+        else if (_hiddenForFullscreen)
+        {
+            _hiddenForFullscreen = false;
+            Show();
+            Topmost = _alwaysOnTop;
+        }
+
+        bool shouldDim = fullscreen && _fullscreenBehavior == FullscreenBehavior.Dim;
+        if (shouldDim != _dimmedForFullscreen)
+        {
+            _dimmedForFullscreen = shouldDim;
+            Opacity = shouldDim ? 0.30 : 1.0;
+        }
+
+        ApplyEffectiveSamplingInterval();
+    }
+
+    private void ApplyEffectiveSamplingInterval()
+    {
+        bool dashboardVisible = _dashboardWindow?.IsVisible == true;
+        bool lowActivity = Visibility != Visibility.Visible && !dashboardVisible;
+        int effectiveInterval = _enableAdaptiveSampling && lowActivity
+            ? Math.Max(5, _samplingIntervalSeconds)
+            : _samplingIntervalSeconds;
+        HardwareMonitorService.Instance.SetSamplingInterval(effectiveInterval);
     }
 
     private void FixedToRight()
@@ -597,17 +970,26 @@ public partial class MainWindow : Window
         Left = config.Left;
         _isDockedRight = config.IsDockedRight;
         _isLocked = config.IsLocked;
+        _showCpu = config.ShowCpu;
+        _showGpu = config.ShowGpu;
         _showRam = config.ShowRam;
         _showVram = config.ShowVram;
         _showUpload = config.ShowUpload;
         _showDownload = config.ShowDownload;
         _currentTheme = config.Theme;
+        _gpuDisplayMetric = config.GpuDisplayMetric;
+        _ramDisplayMode = config.RamDisplayMode;
+        _vramDisplayMode = config.VramDisplayMode;
+        _networkDisplayUnit = config.NetworkDisplayUnit;
         _widgetOpacity = config.WidgetOpacity;
+        _alwaysOnTop = config.AlwaysOnTop;
+        _fullscreenBehavior = config.FullscreenBehavior;
         _delayedStartSeconds = config.DelayedStartSeconds;
         _enableGlobalHotkey = config.EnableGlobalHotkey;
         _trackTopGpuProcess = config.TrackTopGpuProcess;
         _enableAlerts = config.EnableAlerts;
         _samplingIntervalSeconds = config.SamplingIntervalSeconds;
+        _enableAdaptiveSampling = config.EnableAdaptiveSampling;
     }
 
     private void SaveConfig()
@@ -616,20 +998,55 @@ public partial class MainWindow : Window
         _config.Left = Left;
         _config.IsDockedRight = _isDockedRight;
         _config.IsLocked = _isLocked;
+        _config.ShowCpu = _showCpu;
+        _config.ShowGpu = _showGpu;
         _config.ShowRam = _showRam;
         _config.ShowVram = _showVram;
         _config.ShowUpload = _showUpload;
         _config.ShowDownload = _showDownload;
         _config.Theme = _currentTheme;
+        _config.GpuDisplayMetric = _gpuDisplayMetric;
+        _config.RamDisplayMode = _ramDisplayMode;
+        _config.VramDisplayMode = _vramDisplayMode;
+        _config.NetworkDisplayUnit = _networkDisplayUnit;
         _config.WidgetOpacity = _widgetOpacity;
+        _config.AlwaysOnTop = _alwaysOnTop;
+        _config.FullscreenBehavior = _fullscreenBehavior;
         _config.DelayedStartSeconds = _delayedStartSeconds;
         _config.EnableGlobalHotkey = _enableGlobalHotkey;
         _config.TrackTopGpuProcess = _trackTopGpuProcess;
         _config.EnableAlerts = _enableAlerts;
         _config.SamplingIntervalSeconds = _samplingIntervalSeconds;
+        _config.EnableAdaptiveSampling = _enableAdaptiveSampling;
 
-        if (!ConfigStore.TrySave(_config))
-            Debug.WriteLine("\u4FDD\u5B58\u914D\u7F6E\u5931\u8D25\u3002");
+        if (ConfigStore.TrySave(_config))
+            return;
+
+        Debug.WriteLine("\u4FDD\u5B58\u914D\u7F6E\u5931\u8D25\u3002");
+        if (_config.IsReadOnlyDueToUnsupportedConfig || _configSaveWarningShown || !IsLoaded || _isExiting)
+            return;
+
+        _configSaveWarningShown = true;
+        const string message =
+            "配置保存失败，本次更改只在当前运行期间生效。请检查磁盘空间以及 %LocalAppData%\\gxTempMonitor 的写入权限。";
+        if (_settingsWindow?.IsVisible == true)
+        {
+            System.Windows.MessageBox.Show(
+                _settingsWindow,
+                message,
+                "无法保存配置",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+        else if (_notifyIcon != null)
+        {
+            // Startup failures should not steal focus from the foreground app.
+            _notifyIcon.ShowBalloonTip(
+                8000,
+                "gxTempMonitor 无法保存配置",
+                message,
+                System.Windows.Forms.ToolTipIcon.Warning);
+        }
     }
 
     private void EnsureWindowIsVisible()
@@ -739,11 +1156,36 @@ public partial class MainWindow : Window
 
     private void ApplyVisibilitySettings()
     {
+        CpuRow.Visibility = _showCpu ? Visibility.Visible : Visibility.Collapsed;
+        GpuRow.Visibility = _showGpu ? Visibility.Visible : Visibility.Collapsed;
         RamRow.Visibility = _showRam ? Visibility.Visible : Visibility.Collapsed;
         VramRow.Visibility = _showVram ? Visibility.Visible : Visibility.Collapsed;
         NetUpRow.Visibility = _showUpload ? Visibility.Visible : Visibility.Collapsed;
         NetDownRow.Visibility = _showDownload ? Visibility.Visible : Visibility.Collapsed;
+        ApplyMetricOrder();
         UpdateVisibilityMenuItems();
+    }
+
+    private void ApplyMetricOrder()
+    {
+        UIElement[] rows = [CpuRow, GpuRow, RamRow, VramRow, NetUpRow, NetDownRow];
+        foreach (UIElement row in rows)
+            MainStack.Children.Remove(row);
+
+        foreach (WidgetMetric metric in _config.MetricOrder)
+        {
+            UIElement row = metric switch
+            {
+                WidgetMetric.Cpu => CpuRow,
+                WidgetMetric.Gpu => GpuRow,
+                WidgetMetric.Ram => RamRow,
+                WidgetMetric.Vram => VramRow,
+                WidgetMetric.Upload => NetUpRow,
+                WidgetMetric.Download => NetDownRow,
+                _ => CpuRow
+            };
+            MainStack.Children.Add(row);
+        }
     }
 
     private void UpdateVisibilityMenuItems()
@@ -834,12 +1276,15 @@ public partial class MainWindow : Window
         _trackTopGpuProcess = enabled;
         HardwareMonitorService.Instance.SetProcessTrackingEnabled(enabled);
         UpdateRuntimeOptionMenuItems();
+        ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
         SaveConfig();
     }
 
     private void SetAlertsEnabled(bool enabled)
     {
         _enableAlerts = enabled;
+        _config.EnableAlerts = enabled;
+        _alertEngine.Reset();
         if (!enabled && _isFlashing)
         {
             _isFlashing = false;
@@ -847,13 +1292,16 @@ public partial class MainWindow : Window
         }
 
         UpdateRuntimeOptionMenuItems();
+        ApplySnapshot(HardwareMonitorService.Instance.LatestSnapshot);
+        _dashboardWindow?.ApplyConfiguration(_config);
         SaveConfig();
     }
 
     private void SetSamplingInterval(int seconds)
     {
         _samplingIntervalSeconds = seconds is 1 or 2 or 5 ? seconds : 1;
-        HardwareMonitorService.Instance.SetSamplingInterval(_samplingIntervalSeconds);
+        _config.SamplingIntervalSeconds = _samplingIntervalSeconds;
+        ApplyEffectiveSamplingInterval();
         UpdateRuntimeOptionMenuItems();
         SaveConfig();
     }
@@ -871,15 +1319,19 @@ public partial class MainWindow : Window
         {
             case MetricVisibility.Ram:
                 _showRam = isVisible;
+                _config.ShowRam = isVisible;
                 break;
             case MetricVisibility.Vram:
                 _showVram = isVisible;
+                _config.ShowVram = isVisible;
                 break;
             case MetricVisibility.Upload:
                 _showUpload = isVisible;
+                _config.ShowUpload = isVisible;
                 break;
             case MetricVisibility.Download:
                 _showDownload = isVisible;
+                _config.ShowDownload = isVisible;
                 break;
         }
 
@@ -889,31 +1341,18 @@ public partial class MainWindow : Window
 
     private void RestoreDefaultState()
     {
-        _showRam = true;
-        _showVram = true;
-        _showUpload = true;
-        _showDownload = true;
-        _currentTheme = WidgetTheme.Dark;
-        _widgetOpacity = 0.78;
-        _delayedStartSeconds = 0;
-        _enableGlobalHotkey = false;
-        _trackTopGpuProcess = false;
-        _enableAlerts = true;
-        _samplingIntervalSeconds = 1;
-        _isDockedRight = true;
-        HardwareMonitorService.Instance.Configure(_samplingIntervalSeconds, _trackTopGpuProcess);
-        UpdateHotkeyRegistration();
-        ResetMaxValues();
-        ApplyVisibilitySettings();
-        ApplyTheme();
-        UpdateOpacityMenuItems();
-        UpdateDelayMenuItems();
-        UpdateRuntimeOptionMenuItems();
-        ResetWindowPosition();
-        if (_isLocked)
+        bool wasLocked = _isLocked;
+        bool preserveUnsupportedConfigReadOnly = _config.IsReadOnlyDueToUnsupportedConfig;
+        _config = new AppConfig
         {
+            IsReadOnlyDueToUnsupportedConfig = preserveUnsupportedConfigReadOnly
+        };
+        ApplyConfig(_config);
+        ApplyRuntimeConfiguration();
+        ResetMaxValues();
+        ResetWindowPosition();
+        if (wasLocked)
             SetLock(false);
-        }
 
         EnsureWindowIsVisible();
         FixedToRight();
@@ -1158,6 +1597,7 @@ public partial class MainWindow : Window
     private void Delay10_Click(object sender, RoutedEventArgs e) => SetDelayedStart(10);
     private void Delay20_Click(object sender, RoutedEventArgs e) => SetDelayedStart(20);
     private void Delay30_Click(object sender, RoutedEventArgs e) => SetDelayedStart(30);
+    private void Delay60_Click(object sender, RoutedEventArgs e) => SetDelayedStart(60);
 
     private void SetDelayedStart(int seconds)
     {
@@ -1187,7 +1627,7 @@ public partial class MainWindow : Window
             File.WriteAllText(dialog.FileName, csv, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
             System.Windows.MessageBox.Show($"\u5DF2\u5BFC\u51FA\u5230 {dialog.FileName}", "\u5BFC\u51FA\u6210\u529F", MessageBoxButton.OK, MessageBoxImage.Information);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException or NotSupportedException or ArgumentException)
         {
             System.Windows.MessageBox.Show($"\u5BFC\u51FA\u5931\u8D25: {ex.Message}", "\u9519\u8BEF", MessageBoxButton.OK, MessageBoxImage.Error);
         }
@@ -1196,9 +1636,12 @@ public partial class MainWindow : Window
     private void IdleTimer_Tick(object? sender, EventArgs e)
     {
         AnimateBackgroundOpacity(_widgetOpacity, TimeSpan.FromSeconds(1));
-        AnimateMainContentOpacity(_widgetOpacity + 0.06, TimeSpan.FromSeconds(1));
+        AnimateMainContentOpacity(GetIdleContentOpacity(_widgetOpacity), TimeSpan.FromSeconds(1));
         _idleTimer?.Stop();
     }
+
+    internal static double GetIdleContentOpacity(double widgetOpacity) =>
+        Math.Clamp(widgetOpacity + 0.06, 0, 1);
 
     private void MainBorder_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
     {
@@ -1248,16 +1691,28 @@ public partial class MainWindow : Window
     private void AnimateMainContentOpacity(double targetOpacity, TimeSpan duration) =>
         MainStack.BeginAnimation(UIElement.OpacityProperty, new DoubleAnimation(targetOpacity, duration));
 
-    private static void UpdateIndicator(System.Windows.Controls.Border indicator, float value)
+    private System.Windows.Media.Brush GetConfiguredAlertBrush(float value, int threshold)
     {
-        if (value >= 90)
+        if (!_config.EnableAlerts) return UiHelper.NormalBrush;
+        if (value >= threshold) return UiHelper.CriticalBrush;
+        if (value >= threshold - _config.AlertHysteresis) return UiHelper.WarningBrush;
+        return UiHelper.NormalBrush;
+    }
+
+    private static void UpdateIndicator(
+        System.Windows.Controls.Border indicator,
+        float value,
+        float warningThreshold = 80,
+        float criticalThreshold = 90)
+    {
+        if (value >= criticalThreshold)
         {
             indicator.Background = UiHelper.CriticalBrush;
             indicator.Opacity = 1;
             return;
         }
 
-        if (value >= 80)
+        if (value >= warningThreshold)
         {
             indicator.Background = UiHelper.WarningBrush;
             indicator.Opacity = 0.8;
@@ -1293,23 +1748,42 @@ public partial class MainWindow : Window
 
     private void Window_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
-        if (_dashboardWindow == null)
+        EnsureDashboardWindow();
+        if (_dashboardWindow?.Visibility == Visibility.Visible)
         {
-            _dashboardWindow = new DashboardWindow();
-            _dashboardWindow.Show();
+            _dashboardWindow.Hide();
         }
         else
         {
-            if (_dashboardWindow.Visibility == Visibility.Visible)
-            {
-                _dashboardWindow.Hide();
-            }
-            else
-            {
-                _dashboardWindow.Show();
-            }
+            _dashboardWindow?.Show();
+            _dashboardWindow?.Activate();
         }
+
+        ApplyEffectiveSamplingInterval();
     }
+
+    private void ShowDashboard()
+    {
+        EnsureDashboardWindow();
+        _dashboardWindow?.Show();
+        _dashboardWindow?.Activate();
+        ApplyEffectiveSamplingInterval();
+    }
+
+    private void EnsureDashboardWindow()
+    {
+        if (_dashboardWindow != null) return;
+
+        _dashboardWindow = new DashboardWindow(_config);
+        _dashboardWindow.IsVisibleChanged += DashboardWindow_IsVisibleChanged;
+    }
+
+    private void DashboardWindow_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e) =>
+        ApplyEffectiveSamplingInterval();
+
+    private void Dashboard_Click(object sender, RoutedEventArgs e) => ShowDashboard();
+
+    private void Settings_Click(object sender, RoutedEventArgs e) => OpenSettings();
 
     private static void ResetMaxValues()
     {
@@ -1326,8 +1800,16 @@ public partial class MainWindow : Window
 
         if (_dashboardWindow != null)
         {
+            _dashboardWindow.IsVisibleChanged -= DashboardWindow_IsVisibleChanged;
             _dashboardWindow.PrepareForExit();
             _dashboardWindow.Close();
+        }
+
+        if (_settingsWindow != null)
+        {
+            _settingsWindow.SettingsApplied -= SettingsWindow_SettingsApplied;
+            _settingsWindow.Close();
+            _settingsWindow = null;
         }
 
         CleanupResources();
@@ -1361,6 +1843,9 @@ public partial class MainWindow : Window
         _idleTimer?.Stop();
         if (_idleTimer != null)
             _idleTimer.Tick -= IdleTimer_Tick;
+        _environmentTimer?.Stop();
+        if (_environmentTimer != null)
+            _environmentTimer.Tick -= EnvironmentTimer_Tick;
 
         IntPtr hwnd = new WindowInteropHelper(this).Handle;
         if (_hotkeyRegistered && hwnd != IntPtr.Zero)
@@ -1376,6 +1861,10 @@ public partial class MainWindow : Window
             UnsubscribeFromDisplayChanges();
         _notifyIcon?.Dispose();
         _notifyIcon = null;
+        _trayContextMenu?.Dispose();
+        _trayContextMenu = null;
+        _applicationIcon?.Dispose();
+        _applicationIcon = null;
     }
 
     private enum MetricVisibility

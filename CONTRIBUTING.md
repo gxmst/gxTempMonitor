@@ -7,14 +7,16 @@
 ## 开发环境
 
 - 仍受支持的 Windows 10/11
-- .NET 10 SDK
+- `global.json` 指定的 .NET 10 SDK feature band
 - 支持 .NET 10 / WPF 的 Visual Studio 或其他编辑器（可选）
 - 对应厂商显卡与驱动（仅在修改 NVML/ADL Provider 时需要）
 
 ```powershell
-dotnet restore TempMonitor/TempMonitor.csproj
+dotnet restore TempMonitor.Tests/TempMonitor.Tests.csproj --locked-mode
 dotnet build TempMonitor/TempMonitor.csproj -c Release --warnaserror
 ```
+
+主项目的构建目标会读取 `app.manifest`，并要求 `assemblyIdentity/@version` 与项目的 `AssemblyVersion` 完全一致；升级版本时两处必须同时更新。
 
 ## 安全与兼容性约束
 
@@ -59,6 +61,7 @@ CPU Package 温度暂不在实现范围内。不要用 ACPI Thermal Zone 冒充 
 
 - 用户可写数据保存到 `%LocalAppData%\gxTempMonitor`，不要写入安装目录。
 - 配置新增字段必须有安全默认值、范围校验，并兼容旧配置缺字段的情况。
+- 配置结构变更必须递增 `SchemaVersion` 并提供显式迁移；导入路径必须重新执行与正常加载相同的校验。
 - 配置写入使用临时文件与原子替换，避免崩溃后留下半个 JSON。
 - 日志不得记录访问令牌、路径中的敏感信息或完整环境变量。
 - CSV 使用固定文化格式和 RFC 4180 转义；可能被表格软件解释为公式的文本必须转义。
@@ -68,7 +71,8 @@ CPU Package 温度暂不在实现范围内。不要用 ACPI Thermal Zone 冒充 
 提交前至少执行：
 
 ```powershell
-dotnet restore TempMonitor/TempMonitor.csproj `
+dotnet restore TempMonitor.Tests/TempMonitor.Tests.csproj `
+  --locked-mode `
   -p:NuGetAudit=true `
   -p:NuGetAuditMode=all
 
@@ -115,7 +119,12 @@ dotnet test TempMonitor.Tests/TempMonitor.Tests.csproj -c Release --no-restore -
 | `SelfContained-x64` | 自包含 | x64 |
 | `SelfContained-arm64` | 自包含 | ARM64 |
 
-正式发布顺序必须是：全新目录发布 → 冒烟测试 → Authenticode 签名与时间戳 → 验签 → 生成发布载荷 SHA-256 → 生成并验证 SBOM → 上传。签名会改变哈希，不能沿用签名前的 SBOM 或校验和。详见 [release/SIGNING.md](release/SIGNING.md)。
+公开发布可以选择两条明确流程：
+
+- 个人项目暂不签名时：全新目录发布 → 冒烟测试 → 明确标注 `unsigned` → 生成发布载荷 SHA-256 与 SBOM → 保留构建来源证明 → 上传；
+- 具备 Authenticode 证书时：全新目录发布 → 冒烟测试 → 签名与可信时间戳 → 验签 → 重新生成发布载荷 SHA-256、SBOM 与来源证明 → 上传。
+
+签名会改变哈希，不能沿用签名前的 SBOM、校验和或 provenance。详见 [release/SIGNING.md](release/SIGNING.md)。
 
 ## Pull Request
 

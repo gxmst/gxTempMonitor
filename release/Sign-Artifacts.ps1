@@ -11,6 +11,8 @@ param(
     [ValidateSet('CurrentUser', 'LocalMachine')]
     [string] $CertificateStore = 'CurrentUser',
 
+    [string] $SignToolPath,
+
     [ValidateNotNullOrEmpty()]
     [uri] $TimestampUrl = 'http://timestamp.digicert.com'
 )
@@ -18,25 +20,49 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Test-MicrosoftSignTool {
+    param([Parameter(Mandatory)][string] $CandidatePath)
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $CandidatePath
+    return $signature.Status -eq 'Valid' -and
+        $null -ne $signature.SignerCertificate -and
+        $signature.SignerCertificate.Subject -match '(^|,\s*)O=Microsoft Corporation(,|$)'
+}
+
 function Find-SignTool {
-    $command = Get-Command 'signtool.exe' -ErrorAction SilentlyContinue
-    if ($null -ne $command) {
-        return $command.Source
+    param([string] $ExplicitPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
+        $resolved = Resolve-Path -LiteralPath $ExplicitPath -ErrorAction Stop
+        $item = Get-Item -LiteralPath $resolved.Path -ErrorAction Stop
+        if ($item.PSIsContainer -or $item.Name -ne 'signtool.exe') {
+            throw "Expected a signtool.exe file: $ExplicitPath"
+        }
+        if (-not (Test-MicrosoftSignTool -CandidatePath $item.FullName)) {
+            throw "The selected signtool.exe does not have a valid Microsoft signature: $($item.FullName)"
+        }
+
+        return $item.FullName
+    }
+
+    if ([string]::IsNullOrWhiteSpace(${env:ProgramFiles(x86)})) {
+        throw 'ProgramFiles(x86) is unavailable; pass -SignToolPath explicitly.'
     }
 
     $kitsRoot = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
     if (Test-Path -LiteralPath $kitsRoot) {
-        $candidate = Get-ChildItem -LiteralPath $kitsRoot -Filter 'signtool.exe' -File -Recurse |
+        $candidates = Get-ChildItem -LiteralPath $kitsRoot -Filter 'signtool.exe' -File -Recurse |
             Where-Object { $_.FullName -match '[\\/]x64[\\/]signtool\.exe$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
+            Sort-Object FullName -Descending
 
-        if ($null -ne $candidate) {
-            return $candidate.FullName
+        foreach ($candidate in $candidates) {
+            if (Test-MicrosoftSignTool -CandidatePath $candidate.FullName) {
+                return $candidate.FullName
+            }
         }
     }
 
-    throw 'signtool.exe was not found. Install the Windows 10/11 SDK first.'
+    throw 'A Microsoft-signed signtool.exe was not found under Windows Kits. Install the Windows 10/11 SDK or pass -SignToolPath.'
 }
 
 $thumbprint = ($CertificateThumbprint -replace '\s', '').ToUpperInvariant()
@@ -71,7 +97,7 @@ $files = @(
     }
 )
 
-$signTool = Find-SignTool
+$signTool = Find-SignTool -ExplicitPath $SignToolPath
 $storeArgs = @('/s', 'My')
 if ($CertificateStore -eq 'LocalMachine') {
     $storeArgs += '/sm'

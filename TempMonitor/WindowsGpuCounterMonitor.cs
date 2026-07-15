@@ -17,17 +17,19 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
     private const int MaxConsecutiveFailures = 3;
     private const int CachePruneInterval = 60;
     private const long MaxPlausibleMemoryBytes = 1L << 50;
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
+    private static readonly long RetryDelayStopwatchTicks = checked(5L * Stopwatch.Frequency);
 
     private readonly object _syncRoot = new();
     private readonly Dictionary<string, EngineMetadata> _engineMetadata = new(StringComparer.Ordinal);
     private readonly Dictionary<string, CounterSample> _previousEngineSamples = new(StringComparer.Ordinal);
     private readonly Dictionary<AdapterKey, float> _smoothedUsage = new();
+    private GpuDeviceInfo[] _availableDevices = [];
 
     private PerformanceCounterCategory? _engineCategory;
     private PerformanceCounterCategory? _memoryCategory;
     private AdapterKey? _selectedAdapter;
-    private DateTime _nextRetryUtc = DateTime.MinValue;
+    private string? _preferredDeviceIdentifier;
+    private long _nextRetryTimestamp;
     private int _consecutiveReadFailures;
     private int _engineReadFailures;
     private int _memoryReadFailures;
@@ -91,6 +93,42 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
 
     public string VendorName => "Windows";
 
+    public IReadOnlyList<GpuDeviceInfo> AvailableDevices
+    {
+        get
+        {
+            lock (_syncRoot)
+                return (GpuDeviceInfo[])_availableDevices.Clone();
+        }
+    }
+
+    public void SetPreferredDevice(string? deviceIdentifier)
+    {
+        lock (_syncRoot)
+        {
+            string? normalized = string.IsNullOrWhiteSpace(deviceIdentifier)
+                ? null
+                : deviceIdentifier;
+            if (string.Equals(_preferredDeviceIdentifier, normalized, StringComparison.Ordinal))
+                return;
+
+            _preferredDeviceIdentifier = normalized;
+            _selectedAdapter = null;
+        }
+    }
+
+    public void RequestDeviceRefresh()
+    {
+        lock (_syncRoot)
+        {
+            if (_disposed)
+                return;
+
+            ResetCategories(scheduleRetry: false);
+            _nextRetryTimestamp = 0;
+        }
+    }
+
     public bool TryInitialize()
     {
         lock (_syncRoot)
@@ -114,7 +152,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
 
             if (!_categoriesReady)
             {
-                if (DateTime.UtcNow < _nextRetryUtc || !TryInitializeCategories())
+                if (Stopwatch.GetTimestamp() < _nextRetryTimestamp || !TryInitializeCategories())
                     return GpuReading.Empty;
             }
 
@@ -140,6 +178,20 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
                 RegisterReadFailure();
                 return GpuReading.Empty;
             }
+
+            var availableDevices = new List<GpuDeviceInfo>(adapters.Count);
+            foreach (AdapterKey adapter in adapters)
+            {
+                availableDevices.Add(new GpuDeviceInfo(
+                    VendorName,
+                    adapter.Identifier,
+                    $"Windows GPU ({adapter.Identifier})"));
+            }
+            availableDevices.Sort(static (left, right) => string.Compare(
+                left.DeviceIdentifier,
+                right.DeviceIdentifier,
+                StringComparison.Ordinal));
+            _availableDevices = availableDevices.ToArray();
 
             _consecutiveReadFailures = 0;
             _healthy = true;
@@ -199,7 +251,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
 
     private bool TryInitializeCategories()
     {
-        if (DateTime.UtcNow < _nextRetryUtc)
+        if (Stopwatch.GetTimestamp() < _nextRetryTimestamp)
             return false;
 
         ResetCategories(scheduleRetry: false);
@@ -234,7 +286,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
             _consecutiveReadFailures = 0;
             _engineReadFailures = 0;
             _memoryReadFailures = 0;
-            _nextRetryUtc = DateTime.MinValue;
+            _nextRetryTimestamp = 0;
             _categoriesReady = true;
             _accepted = true;
             _healthy = true;
@@ -395,7 +447,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
 
     private void TryRestoreMissingCategory()
     {
-        if (DateTime.UtcNow < _nextRetryUtc)
+        if (Stopwatch.GetTimestamp() < _nextRetryTimestamp)
             return;
 
         bool stillMissing = false;
@@ -438,7 +490,10 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
             stillMissing |= _memoryCategory == null;
         }
 
-        _nextRetryUtc = stillMissing ? DateTime.UtcNow + RetryDelay : DateTime.MinValue;
+        if (stillMissing)
+            ScheduleRetry();
+        else
+            _nextRetryTimestamp = 0;
     }
 
     private void RegisterEngineFailure()
@@ -454,7 +509,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
         _engineReadFailures = 0;
         _engineMetadata.Clear();
         _previousEngineSamples.Clear();
-        _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+        ScheduleRetry();
     }
 
     private void RegisterMemoryFailure()
@@ -468,7 +523,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
 
         _memoryCategory = null;
         _memoryReadFailures = 0;
-        _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+        ScheduleRetry();
     }
 
     private void RegisterReadFailure()
@@ -486,6 +541,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
         _engineMetadata.Clear();
         _previousEngineSamples.Clear();
         _smoothedUsage.Clear();
+        _availableDevices = [];
         _selectedAdapter = null;
         _categoriesReady = false;
         _healthy = false;
@@ -494,14 +550,31 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
         _memoryReadFailures = 0;
 
         if (scheduleRetry)
-            _nextRetryUtc = DateTime.UtcNow + RetryDelay;
+            ScheduleRetry();
     }
+
+    private void ScheduleRetry() =>
+        _nextRetryTimestamp = Stopwatch.GetTimestamp() + RetryDelayStopwatchTicks;
 
     private AdapterKey SelectAdapter(
         HashSet<AdapterKey> adapters,
         Dictionary<AdapterKey, float> usageByAdapter,
         Dictionary<AdapterKey, long> memoryByAdapter)
     {
+        if (!string.IsNullOrWhiteSpace(_preferredDeviceIdentifier))
+        {
+            foreach (AdapterKey adapter in adapters)
+            {
+                if (string.Equals(
+                        adapter.Identifier,
+                        _preferredDeviceIdentifier,
+                        StringComparison.Ordinal))
+                {
+                    return adapter;
+                }
+            }
+        }
+
         using HashSet<AdapterKey>.Enumerator enumerator = adapters.GetEnumerator();
         enumerator.MoveNext();
         AdapterKey best = enumerator.Current;
