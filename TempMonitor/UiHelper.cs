@@ -27,7 +27,7 @@ internal static class UiHelper
         if (bytesPerSecond < 1024) return $"{bytesPerSecond:0.0}B";
         float kb = bytesPerSecond / 1024;
         if (kb < 1024) return $"{kb:0.0}K";
-        return $"{kb / 1024.0:0.1}M";
+        return $"{kb / 1024.0:0.0}M";
     }
 
     public static string FormatOptionalTemp(float? value, string fallback = "-- °C")

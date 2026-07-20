@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -118,6 +119,8 @@ public sealed class HardwareMonitorService : IDisposable
     private const int GpuRetrySeconds = 30;
     private const int ProcessRefreshSeconds = 15;
     private const int GpuProviderMissingSamplesBeforeFallback = 3;
+    private const int WindowsGpuFallbackRefreshSeconds = 10;
+    private const string WindowsGpuProviderName = "Windows";
 
     private readonly object _maxLock = new();
     private readonly object _historyLock = new();
@@ -152,6 +155,7 @@ public sealed class HardwareMonitorService : IDisposable
     private long _nextNetworkRefreshTimestamp;
     private long _nextGpuProbeTimestamp;
     private long _nextProcessRefreshTimestamp;
+    private long _nextWindowsGpuReadTimestamp;
 
     private float _cpuUsageMax;
     private float? _gpuUsageMax;
@@ -523,6 +527,7 @@ public sealed class HardwareMonitorService : IDisposable
         RefreshNetworkInterfaces();
         RefreshGpuMonitorSessions(_gpuMonitors);
         TryProbeGpu(force: true);
+        _nextWindowsGpuReadTimestamp = 0;
         return true;
     }
 
@@ -951,32 +956,26 @@ public sealed class HardwareMonitorService : IDisposable
         string? preferredProvider = selections.GpuProvider;
         string? preferredDeviceIdentifier = selections.GpuDeviceIdentifier;
         var candidates = new List<GpuCandidate>(_gpuMonitors.Count);
-        for (int index = _gpuMonitors.Count - 1; index >= 0; index--)
-        {
-            IGpuMonitor monitor = _gpuMonitors[index];
-            if (!monitor.Initialized)
-            {
-                monitor.Dispose();
-                _gpuMonitors.RemoveAt(index);
-                continue;
-            }
 
-            bool isPreferredProvider = string.Equals(
-                monitor.VendorName,
-                preferredProvider,
+        // Vendor interfaces are cheap per read. The Windows counter fallback
+        // re-reads the whole "GPU Engine" category, which can contain thousands
+        // of instances, so while a vendor provider is serving data the fallback
+        // is only refreshed on a slow cadence to keep its baseline and device
+        // list warm. Engine utilization is a two-sample delta, so a longer
+        // window still yields correct averages.
+        ReadGpuCandidates(candidates, preferredProvider, preferredDeviceIdentifier, windowsCounterPass: false);
+
+        long now = Stopwatch.GetTimestamp();
+        bool windowsProviderInUse =
+            string.Equals(preferredProvider, WindowsGpuProviderName, StringComparison.Ordinal) ||
+            string.Equals(
+                Volatile.Read(ref _selectedGpuProvider),
+                WindowsGpuProviderName,
                 StringComparison.Ordinal);
-            monitor.SetPreferredDevice(isPreferredProvider ? preferredDeviceIdentifier : null);
-
-            GpuReading reading = monitor.Read();
-            if (!monitor.Initialized)
-            {
-                monitor.Dispose();
-                _gpuMonitors.RemoveAt(index);
-                continue;
-            }
-
-            if (HasAnyGpuMetric(reading))
-                candidates.Add(new GpuCandidate(monitor, reading));
+        if (candidates.Count == 0 || windowsProviderInUse || now >= _nextWindowsGpuReadTimestamp)
+        {
+            ReadGpuCandidates(candidates, preferredProvider, preferredDeviceIdentifier, windowsCounterPass: true);
+            _nextWindowsGpuReadTimestamp = now + SecondsToStopwatchTicks(WindowsGpuFallbackRefreshSeconds);
         }
 
         var availableDevices = new List<GpuDeviceInfo>();
@@ -1074,6 +1073,44 @@ public sealed class HardwareMonitorService : IDisposable
         return (selected.Reading, selected.Monitor.VendorName);
     }
 
+    private void ReadGpuCandidates(
+        List<GpuCandidate> candidates,
+        string? preferredProvider,
+        string? preferredDeviceIdentifier,
+        bool windowsCounterPass)
+    {
+        for (int index = _gpuMonitors.Count - 1; index >= 0; index--)
+        {
+            IGpuMonitor monitor = _gpuMonitors[index];
+            if (monitor is WindowsGpuCounterMonitor != windowsCounterPass)
+                continue;
+
+            if (!monitor.Initialized)
+            {
+                monitor.Dispose();
+                _gpuMonitors.RemoveAt(index);
+                continue;
+            }
+
+            bool isPreferredProvider = string.Equals(
+                monitor.VendorName,
+                preferredProvider,
+                StringComparison.Ordinal);
+            monitor.SetPreferredDevice(isPreferredProvider ? preferredDeviceIdentifier : null);
+
+            GpuReading reading = monitor.Read();
+            if (!monitor.Initialized)
+            {
+                monitor.Dispose();
+                _gpuMonitors.RemoveAt(index);
+                continue;
+            }
+
+            if (HasAnyGpuMetric(reading))
+                candidates.Add(new GpuCandidate(monitor, reading));
+        }
+    }
+
     private bool ShouldHoldMissingGpuProvider(string? providerName)
     {
         if (string.IsNullOrWhiteSpace(providerName))
@@ -1136,28 +1173,33 @@ public sealed class HardwareMonitorService : IDisposable
     {
         try
         {
+            // Constructing a PerformanceCounter re-reads its entire category, so
+            // per-instance counters would rescan "GPU Process Memory" once per
+            // GPU process. A single ReadCategory call returns every instance.
             var category = new PerformanceCounterCategory("GPU Process Memory");
-            string[] instances = category.GetInstanceNames();
+            InstanceDataCollectionCollection categoryData = category.ReadCategory();
+            InstanceDataCollection? instances = WindowsGpuCounterMonitor.FindCounter(
+                categoryData,
+                "Dedicated Usage");
+            if (instances == null) return null;
+
             var processVram = new Dictionary<int, long>();
-
-            foreach (string instance in instances)
+            foreach (DictionaryEntry entry in instances)
             {
-                try
+                if (entry.Key is not string instanceName ||
+                    entry.Value is not InstanceData instanceData ||
+                    !TryParseProcessId(instanceName, out int processId))
                 {
-                    if (!TryParseProcessId(instance, out int processId)) continue;
-
-                    using var counter = new PerformanceCounter("GPU Process Memory", "Dedicated Usage", instance, readOnly: true);
-                    long bytes = Math.Max(0, counter.RawValue);
-                    if (bytes == 0) continue;
-
-                    processVram.TryGetValue(processId, out long accumulated);
-                    processVram[processId] = accumulated > long.MaxValue - bytes
-                        ? long.MaxValue
-                        : accumulated + bytes;
+                    continue;
                 }
-                catch (InvalidOperationException)
-                {
-                }
+
+                long bytes = instanceData.RawValue;
+                if (bytes <= 0) continue;
+
+                processVram.TryGetValue(processId, out long accumulated);
+                processVram[processId] = accumulated > long.MaxValue - bytes
+                    ? long.MaxValue
+                    : accumulated + bytes;
             }
 
             if (processVram.Count == 0) return null;

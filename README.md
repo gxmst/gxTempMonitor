@@ -60,7 +60,7 @@ gxTempMonitor 的“默认安全模式”指它只使用 Windows 用户态接口
 
 CPU Package 温度没有可靠、统一的 Windows 用户态接口。为了避免把 ACPI 热区温度误报成 CPU 温度，也为了不引入 MSR/SMBus 内核驱动，本版本不实现 CPU 温度采集；Dashboard 不显示对应卡片，诊断页会注明这一设计边界。
 
-GPU 的温度、功耗和显存能力取决于显卡型号、驱动版本与厂商接口；风扇转速目前暂不采集。Windows 通用计数器通常只能提供负载和部分显存数据。多显卡环境会同时探测可用的 NVIDIA、AMD 与 Windows Provider，默认结合活跃度自动选择；也可以在设置中按 `Provider + 设备标识` 固定设备，目标消失时回退到自动选择。NVIDIA UUID 和 AMD PnP 标识通常可跨会话保持；Windows Provider 使用的 LUID 只保证当前系统会话内稳定，重启或驱动重置后可能变化，此时程序会安全回退到自动选择，用户可重新固定设备。
+GPU 的温度、功耗和显存能力取决于显卡型号、驱动版本与厂商接口；风扇转速目前暂不采集。Windows 通用计数器通常只能提供负载和部分显存数据。当 NVIDIA/AMD 原生接口持续正常供数时，Windows 通用计数器作为后备约每 10 秒刷新一次以降低采样开销；原生接口失效、被选为当前 Provider 或触发设备刷新时会立即恢复正常读取。多显卡环境会同时探测可用的 NVIDIA、AMD 与 Windows Provider，默认结合活跃度自动选择；也可以在设置中按 `Provider + 设备标识` 固定设备，目标消失时回退到自动选择。NVIDIA UUID 和 AMD PnP 标识通常可跨会话保持；Windows Provider 使用的 LUID 只保证当前系统会话内稳定，重启或驱动重置后可能变化，此时程序会安全回退到自动选择，用户可重新固定设备。
 
 运行环境受 .NET 10 的 Windows 支持范围约束，建议使用仍受支持的 Windows 10/11 版本。Windows 7/8 不在支持范围内。`win-arm64` 可以构建和运行，但厂商 GPU 指标仍取决于是否存在同架构的驱动接口；否则使用 Windows 通用回退。
 

@@ -793,6 +793,11 @@ internal sealed class AmdGpuMonitor : IGpuMonitor
         }
     }
 
+    // ADL only invokes this callback for APIs that let the driver size the output
+    // buffer. Every buffer this monitor passes is pre-allocated with an explicit
+    // size, so the callback is not expected to run; if a future ADL build does
+    // call it, the allocation lives for the process lifetime because ADL gives
+    // no notification of when it may be freed.
     private static IntPtr AllocateAdlMemory(int size)
     {
         if (size <= 0)

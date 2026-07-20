@@ -716,7 +716,7 @@ internal sealed class WindowsGpuCounterMonitor : IGpuMonitor
         return uint.TryParse(span, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out result);
     }
 
-    private static InstanceDataCollection? FindCounter(
+    internal static InstanceDataCollection? FindCounter(
         InstanceDataCollectionCollection categoryData,
         string counterName)
     {

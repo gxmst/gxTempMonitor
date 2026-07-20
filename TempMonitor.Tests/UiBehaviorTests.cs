@@ -1,9 +1,28 @@
+using System.Globalization;
 using Xunit;
 
 namespace TempMonitor.Tests;
 
 public sealed class UiBehaviorTests
 {
+    [Fact]
+    public void FormatSpeed_UsesOneDecimalPlaceInEveryUnitRange()
+    {
+        CultureInfo original = CultureInfo.CurrentCulture;
+        CultureInfo.CurrentCulture = CultureInfo.InvariantCulture;
+        try
+        {
+            Assert.Equal("512.0B", UiHelper.FormatSpeed(512));
+            Assert.Equal("1.5K", UiHelper.FormatSpeed(1536));
+            Assert.Equal("5.7M", UiHelper.FormatSpeed(5.67f * 1024 * 1024));
+            Assert.Equal("250.3M", UiHelper.FormatSpeed(250.34f * 1024 * 1024));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
+    }
+
     [Fact]
     public void DashboardAlertBrush_RespectsEnableFlagThresholdAndHysteresis()
     {

@@ -502,7 +502,9 @@ public partial class MainWindow : Window
         if (text.Length > 127)
             text = text.Substring(0, 127);
 
-        _notifyIcon.Text = text;
+        // Every assignment calls Shell_NotifyIcon; identical text can be skipped.
+        if (!string.Equals(_notifyIcon.Text, text, StringComparison.Ordinal))
+            _notifyIcon.Text = text;
     }
 
     private void CheckAlerts(HardwareSnapshot snapshot)
@@ -665,6 +667,9 @@ public partial class MainWindow : Window
             int newStyle = lockIt
                 ? extendedStyle | WsExTransparent | WsExNoActivate
                 : (extendedStyle & ~WsExTransparent) | WsExNoActivate;
+            // SetWindowLong can legitimately return 0, so failure is only
+            // distinguishable when the last error was cleared beforehand.
+            Marshal.SetLastSystemError(0);
             int previousStyle = SetWindowLong(hwnd, GwlExStyle, newStyle);
             if (previousStyle == 0 && Marshal.GetLastPInvokeError() != 0)
                 Debug.WriteLine($"\u66F4\u65B0\u7A97\u53E3\u6837\u5F0F\u5931\u8D25: {Marshal.GetLastPInvokeError()}");
